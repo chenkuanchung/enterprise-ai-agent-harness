@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------
+  # 1. 關聯式資料庫 (State Persistence & RBAC)
+  # ----------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: harness-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: harness_user
+      POSTGRES_PASSWORD: harness_password
+      POSTGRES_DB: harness_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness_user -d harness_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------
+  # 2. 記憶體快取 (Semantic Caching for LLM)
+  # ----------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: harness-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # ----------------------------------------------------
+  # 3. 本地模型推論引擎 (Local Guardrails Fallback)
+  # ----------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: harness-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # --------------------------------------------------
+    # 若你的家用設備具備 NVIDIA GPU，請解除下方註解以啟用硬體加速
+    # --------------------------------------------------
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  postgres_data:
+    name: harness_postgres_data
+  redis_data:
+    name: harness_redis_data
+  ollama_data:
+    name: harness_ollama_data
