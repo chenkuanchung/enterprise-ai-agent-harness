@@ -1,91 +1,112 @@
-# 企業級 AI Agent Runtime Platform 系統技術規格書
+# TECHNICAL_SPEC.md: 企業級 IT 維運 AI Agent 平台技術規格與開發指南
 
-**Document Version:** 2.0 (Production-Ready Architecture)
-**Target Profile:** 適用於企業內部標準化 Agent 基礎設施構建
-**Author:** 系統架構設計師
-
-## 1. 系統概述 (Executive Summary)
-
-### 1.1 產品定位
-本系統為一套高度可擴充的 **AI Agent Runtime Platform (代理運行平台)**。其核心價值在於提供「Agent Harness（外骨骼基礎設施）」，將 LLM 的非確定性邏輯，封裝進嚴謹的軟體工程生命週期中，提供統一的工具調度、狀態管理、權限控制與全鏈路監控。
-
-### 1.2 企業級設計原則
-* **Security & Compliance First (安全與合規優先)**：內建三層 Guardrails、嚴格的 RBAC 權限控管與不可篡改的審計日誌。
-* **Cost & Performance Optimized (成本與效能最佳化)**：導入混合模型路由 (Hybrid Routing) 與語意快取 (Semantic Caching)，極小化高昂的 API 呼叫。
-* **Decoupled Architecture (解耦架構)**：將「業務邏輯」、「提示詞」、「工具介面」與「底層模型」完全抽離，避免供應商綁定 (Vendor Lock-in)。
+## 1. 專案概述 (Project Overview)
+本專案旨在開發一套基於零信任架構（Zero-Trust Architecture）的「智能 ITOps 代理平台」。系統具備跨系統狀態查詢、RAG 知識庫檢索、自動化故障排除與高風險操作審批能力。
+本文件作為 AI 輔助開發（如 Cline, Cursor）之最高指導原則，所有生成的程式碼皆需嚴格遵守以下架構與安全規範。
 
 ---
 
-## 2. 系統架構拓撲 (Architecture Topology)
+## 2. 全局 AI 開發約束條件 (Global AI Coding Constraints)
+為確保達到企業級軟體工程標準，AI 在生成程式碼時**必須**默認實作以下進階機制，無需開發者反覆提醒：
 
-系統分為三大邏輯層：
-
-1. **控制面 (Control Plane)**：負責 API 網關、身分認證 (Auth/RBAC)、Guardrails 審查與路由。
-2. **執行面 (Execution Plane)**：LangGraph 狀態機運行環境、MCP 工具伺服器、模型推論引擎 (Gemini / Local LLM)。
-3. **數據面 (Data Plane)**：狀態持久化 (State DB)、向量上下文記憶 (Vector DB)、監控與審計日誌 (Observability & Audit Logs)。
-
----
-
-## 3. 核心模組詳細設計 (Core Module Specifications)
-
-### 3.1 權限與合規安全模組 (Security, RBAC & Audit)
-* **RBAC (角色權限控制)**：
-    * 所有的 MCP Tool 在註冊時必須宣告 `required_permissions` (例如：`finance:read`, `system:write`)。
-    * 當使用者發起 Request 時，API Gateway 解析 JWT Token 獲取 User Role。
-    * 當 Agent 決定呼叫工具時，Harness 底層的 **Tool Executor Node** 會先進行比對。若權限不足，系統不會執行工具，而是回傳 `PermissionDeniedError` 給 LLM，迫使 LLM 改變計畫或回報使用者。
-* **Audit Logging (合規審計日誌)**：
-    * 獨立於效能監控 (Tracing) 之外，所有觸及高敏感資料庫或執行寫入動作 (如寄信、刪除) 的行為，強制寫入不可篡改的 Elasticsearch 或關聯式資料庫中。
-    * 紀錄欄位包含：`Timestamp`, `User_ID`, `Agent_ID`, `Tool_Name`, `Executed_Parameters`, `Approval_Status`。
-* **Data Masking (資料脫敏)**：
-    * 整合 Microsoft Presidio，在 Prompt 離開企業內網送往外部 LLM (如 Gemini) 前，自動將機密資訊替換為脫敏標籤。
-
-### 3.2 Agent Harness & Orchestration (狀態機與編排模組)
-* **持久化與斷點續傳 (Checkpointing)**：
-    * 利用 PostgreSQL 作為 Checkpoint Saver。Agent 執行到一半若伺服器重啟，或是進入 Human-in-the-loop (HITL) 等待人類審批時，狀態 (State) 會被凍結並存入 DB。
-* **Multi-Agent Orchestration (多代理協作)**：
-    * 實作 **Supervisor Pattern**：一個高級 Planner Agent 負責拆解任務，並將 Sub-tasks 分發給專責的 Worker Agents。
-* **Timeouts & Retry 策略**：
-    * 在 Harness 層對所有外部 Tool Call 包裝 Circuit Breaker (斷路器) 與 Exponential Backoff (指數退避重試)，防止 Agent 因外部 API 塞車而無限卡死。
-
-### 3.3 MCP 工具生態與隔離機制 (Tool Registry & Isolation)
-* **動態工具發現 (Dynamic Discovery)**：
-    * 支援 Model Context Protocol (MCP)。平台啟動時動態抓取各業務系統提供的 JSON-RPC Schema，轉換為 Agent 可理解的 Tools。
-* **Multi-Tenancy 隔離 (多租戶架構)**：
-    * 危險工具必須綁定 Sandbox 機制。不同部門 (Tenants) 的 Agent 只能讀寫掛載於自己 Workspace 下的檔案路徑，杜絕跨部門資料越權。
-
-### 3.4 企業級 Guardrails 系統 (雙模型防禦網)
-1. **Input Guardrail**：Lite 模型判斷 Prompt 是否包含惡意注入 (Prompt Injection) 或偏離業務主題 (Topic Jailbreak)。
-2. **Action Guardrail**：Pydantic 進行工具參數強型別校驗；Lite 模型評估工具呼叫的邏輯合理性與破壞性。
-3. **Output Guardrail**：Lite 模型進行 Groundedness Check (事實一致性檢驗)，確保回覆不含捏造數據或敏感系統路徑。
-
-### 3.5 LLMOps、效能與評估 (Operations & Evals)
-* **語意快取 (Semantic Caching)**：
-    * 導入 RedisVL。高度相似的問題直接計算 Embedding 相似度，若達標則直接返回 Cache 答案，繞過 LLM 推理。
-* **Prompt Management (提示詞版本控制)**：
-    * 將 Prompt 抽離至 Langfuse 或資料庫管理，支援動態熱更新 (Hot Reload) 與 A/B 測試。
-* **全鏈路可觀測性 (Tracing & Eval Pipeline)**：
-    * 利用 Langfuse 記錄每一步 Graph Node 的 Token 消耗與延遲。
-    * 建立 CI/CD Eval Pipeline：當更換模型版本時，自動執行 Golden Dataset 批次測試，防止系統靜默退化 (Silent Regression)。
+1.  **防禦性編程與錯誤重試 (Defensive Programming & Retries)：**
+    * 所有對外部 API（包含 Mock API 與 LLM API）的呼叫，**強制實作 Exponential Backoff（指數退避）重試機制**（建議使用 `tenacity` 套件），以處理 Rate Limits (`429`) 或暫時性網路錯誤 (`5xx`)。
+    * 嚴禁吞噬例外錯誤（Swallowing Exceptions）。所有 API 呼叫失敗必須回傳具備結構化錯誤訊息的 JSON，並引導 Agent 重新規劃，禁止讓系統直接 Crash。
+2.  **不可篡改之審計日誌 (Immutable Audit Logging)：**
+    * 所有具備「狀態變更」之工具呼叫（如：解鎖帳號、清除快取、抹除設備），除了基本的 Debug Log 外，**必須**將執行紀錄（包含 `user_id`, `action`, `parameters`, `timestamp`, `status`）寫入資料庫的 `audit_logs` 表中，並預留未來演進為 Append-only（僅限新增）之防篡改架構。
+3.  **非同步優先 (Async-First)：**
+    * 後端 FastAPI 路由、資料庫查詢（如 `asyncpg` 或 SQLAlchemy Async）與 LLM 呼叫，**全面強制使用 `async/await` 架構**，確保高併發下的系統吞吐量。
+4.  **強型別與驗證 (Strict Typing & Validation)：**
+    * 所有 Python 函式必須包含完整的 Type Hints。
+    * 所有傳入 API 網關與 MCP 工具的資料，**強制使用 Pydantic v2 進行 Schema 驗證**。
+5.  **機密管理與設定 (Secrets Management)：**
+    * 嚴禁在程式碼中 Hardcode 任何 API Key、密碼或連線字串。
+    * 所有環境變數必須透過 `pydantic-settings` 統一進行型別與預設值驗證，並由 `.env` 檔案動態注入。
+6.  **強制結構化輸出 (Structured Generation)：**
+    * 所有 LLM 的推論請求，若涉及後續程式邏輯判斷（如意圖路由），必須強制啟用 LLM 的 JSON Mode 或 Structured Output 功能，並以 Pydantic Schema 定義回傳格式，確保狀態機解析穩定。
+7.  **自動降級備援 (Automated Fallback)：**
+    * 在呼叫雲端 LLM API 時需實作 Fallback 邏輯。若主要模型發生非 Rate Limit 之系統異常（如 `500 Internal Server Error`），需自動捕獲例外並切換至地端備援模型（如 Ollama）進行推論，確保服務不中斷。
 
 ---
 
-## 4. 基礎設施與技術選型 (Tech Stack)
+## 3. 系統架構與技術棧 (Architecture & Tech Stack)
 
-* **Orchestration & Framework**: `FastAPI`, `LangGraph`
-* **LLM Inference**: `Gemini API` (Main), `Ollama` (Guardrails/Worker)
-* **Tool Protocol**: `MCP (Model Context Protocol)` SDK
-* **Data Validation & Auth**: `Pydantic v2`, `JWT`
-* **State & Persistence**: `PostgreSQL`
-* **Caching & Memory**: `Redis`
-* **LLMOps**: `Langfuse`
-* **Deployment**: `Docker Compose`
+### 3.1. 前端層 (Frontend)
+* **框架：** Next.js (App Router) + TypeScript + Tailwind CSS。
+* **AI 整合：** Vercel AI SDK (實作 Streaming UI 與 Tool Call 渲染)。
+* **獨立模組：** IT 主管審批儀表板（Approval Dashboard），用於處理 HITL 請求。
+
+### 3.2. API 網關與安全層 (API Gateway & Security Layer)
+* **框架：** FastAPI (Python 3.10+)。
+* **身分認證：** POC 階段實作 JWT (JSON Web Tokens)，架構需預留介接 Entra ID (OIDC/SAML) 之擴充彈性。
+* **權限控制 (RBAC + ABAC Hybrid)：** PyCasbin，嚴格驗證 Request 角色權限，並預留擴充屬性級控制（如：時間、設備狀態、風險分數）之介面。
+* **資料脫敏：** 請求進入 Agent 前，透過 Microsoft Presidio 攔截並遮蔽 PII（如身分證字號、私人 Email）。
+
+### 3.3. Agent 核心編排層 (Agent Orchestration Layer)
+* **框架：** LangGraph + LangChain Core。
+* **記憶體與狀態：** 整合 PostgreSQL 作為 Checkpoint Saver，實現斷點續傳。
+* **護欄 (Guardrails)：** NVIDIA NeMo Guardrails，限制對話必須聚焦於 IT 維運，阻擋 Prompt Injection。
+* **模型選型：** 預設採用 Gemini API (如 `gemini-3.5-flash` 或 `gemini-3.1-flash-lite`) 作為推論大腦。
+
+### 3.4. 模擬基礎設施層 (Mock Infrastructure & Tools)
+* 基於 Model Context Protocol (MCP) 開發獨立工具。
+* 透過 Docker Compose 啟動獨立的 FastAPI Mock Server 與 PostgreSQL，模擬真實企業環境（包含 CMDB 與 KB）。
+
+### 3.5. 測試與持續整合 (Testing & CI/CD)
+* **測試框架：** 使用 `pytest` 進行單元測試與整合測試。
+* **測試覆蓋要求：** 所有新增之 MCP 工具與 FastAPI 路由，AI 必須同步生成對應的測試案例，確保邊界條件（Edge Cases）與異常捕獲邏輯正確運作。
+* **版本控制：** 程式碼需符合 GitHub 協作規範，確保未來能順利串接 GitHub Actions 執行自動化測試流水線。
 
 ---
 
-## 5. 核心 API 介面設計草案 (API Specifications)
+## 4. 核心工作流與狀態機設計 (LangGraph Workflow)
 
-* `POST /v1/chat/completions`：標準化對話入口。
-* `POST /v1/agents/{agent_id}/runs`：觸發特定 Agent 執行長時間任務。
-* `GET /v1/agents/runs/{run_id}/stream`：(SSE) 實時訂閱 Agent 執行進度與思考鏈。
-* `POST /v1/approvals/{run_id}`：HITL 介面，供管理員送出審批決定。
-* `GET /v1/tools`：動態回傳當前使用者有權限呼叫的 MCP Tools 列表。
+LangGraph 狀態機需完整實作「企業工單生命週期 (Incident Lifecycle)」，包含以下核心 Nodes 與 Edges：
+
+1.  **`Incident_Creation_Node`**：接收使用者問題，自動於 ITSM 系統中建立或關聯追蹤工單 (Ticket)。
+2.  **`Diagnosis_&_RAG_Node`**：判斷意圖並強制呼叫 KB Tool 檢索 IT SOP，確保後續操作符合標準流程。
+3.  **`Permission_Check_Node`**：工具執行前的攔截點，調用 Casbin 確認使用者是否具備對應設備/服務之操作權限。
+4.  **`Tool_Execution_Node`**：實際呼叫 Mock IAM/MDM/CMDB API 進行查詢或修復。
+5.  **`HITL_Approval_Node` (關鍵)**：
+    * **觸發條件：** 當判斷意圖為高風險操作（如 `Device Wipe` 或 `Reset Admin Password`）時觸發。
+    * **行為：** 呼叫 LangGraph 的 `interrupt()` 凍結當前執行狀態（State），並向審批儀表板發送 Webhook，等待主管審批後方可 Resume。
+6.  **`Ticket_Closure_Node`**：驗證修復結果，寫入 Resolution Notes 並自動關閉工單。
+
+---
+
+## 5. Mock API 與資料庫綱要 (Mock API & Database Schema)
+
+開發期間需實作以下 Mock 微服務與對應數據表：
+
+### 5.1. 數據庫綱要 (PostgreSQL)
+* **IAM/MDM 領域：**
+  * `users` 表：`id`, `email`, `role`, `account_status` (Active/Locked)。
+  * `devices` 表：`device_id`, `owner_id`, `os_version`, `compliance_status`, `disk_space_mb`。
+* **ITSM/CMDB 領域 (新增)：**
+  * `cmdb_relations` 表：`asset_id`, `dependency_id`, `relation_type` (模擬設備、網路與核心服務之依賴關係)。
+  * `incidents` 表：`ticket_id`, `user_id`, `status` (Open/Resolved/Closed), `issue_description`, `resolution_notes`。
+* **安全領域：**
+  * `audit_logs` 表：記錄所有變更操作。
+
+### 5.2. MCP 註冊工具列表 (MCP Tools)
+* **`Mock_KB_Tool` (RAG 知識庫)**
+    * `query_sop(query: str)`：模擬 RAG 檢索維運手冊，提供 Agent 處置標準。
+* **`Mock_CMDB_Tool` (組態管理)**
+    * `get_asset_dependencies(asset_id: str)`：查詢特定設備若重啟或抹除，將影響哪些關聯服務。
+* **`Mock_ITSM_Tool` (工單管理)**
+    * `create_ticket(user_id: str, issue: str)`：建立新工單。
+    * `resolve_ticket(ticket_id: str, notes: str)`：填寫修復紀錄並結案。
+* **`Mock_IAM_Tool` (身分管理)**
+    * `check_account_status(email: str)`：回傳帳號狀態。
+    * `unlock_account(email: str)`：將狀態改為 Active（需 Audit Log）。
+* **`Mock_MDM_Tool` (端點管理)**
+    * `get_device_health(device_id: str)`：回傳硬碟與合規狀態。
+    * `clear_system_cache(device_id: str)`：釋放硬碟空間（需 Audit Log）。
+    * `remote_wipe_device(device_id: str)`：**嚴格綁定 HITL 審批流程**。
+
+---
+
+## 6. LLMOps 與可觀測性 (Observability)
+* 全面導入 **Langfuse** 進行全鏈路監控。
+* 所有 LLM 呼叫、Tool Calls 與 LangGraph 節點轉換，必須包裝在 Langfuse 的 Trace 與 Span 中。
+* **SLA 與成本追蹤：** 需於 Dashboard 明確量化並追蹤 `Token Cost per Ticket`（單一工單成本）與 `MTTR`（平均修復時間），以利後期進行 Evals 自動化評估與投資報酬率 (ROI) 調校。
