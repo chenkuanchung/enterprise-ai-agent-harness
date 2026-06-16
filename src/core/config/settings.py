@@ -6,15 +6,22 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     API_V1_STR: str = "/v1"
     SECRET_KEY: str
+    LOG_LEVEL: str = "DEBUG"
 
     # 數據庫連線設定
     DATABASE_URL: str
+
+    # 快取連線設定 (對齊 .env，讓全域統一管理)
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # AI 模型金鑰
     GOOGLE_API_KEY: str
 
     # Agent_ID
     AGENT_ID: str = "ITOps-Agent-POC-01"
+
+    # MCP 伺服器連線網址
+    MCP_SERVER_URL: str = "http://localhost:8001/sse"
 
     # Pydantic Settings 設定，告訴它去哪裡找 .env
     model_config = SettingsConfigDict(
