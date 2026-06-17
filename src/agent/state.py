@@ -11,8 +11,9 @@ class ITOpsAgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     
     # 2. 業務上下文 (Context)
-    user_id: str                   # 當前發起請求的員工 ID
     ticket_id: Optional[str]       # 目前正在處理的工單編號 (一開始可能是 None)
     
     # 3. 審批控制 (HITL 機制)
     requires_approval: bool        # 標記當前操作是否需要主管簽核
+
+    email: str
