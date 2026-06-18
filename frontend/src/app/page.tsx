@@ -63,85 +63,147 @@ export default function Home() {
   };
 
   // 傳送訊息 (包含 SSE 串流解析)
-  const sendMessage = async (text: string, action: "chat" | "approve" | "reject" = "chat") => {
-    if (!text.trim() || isLoading || !currentUser) return;
+  const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat") => {
+  if (!text.trim() && actionType === "chat") return;
 
-    const userMsgId = Date.now().toString();
-    const agentMsgId = (Date.now() + 1).toString();
+  // 1. 建立使用者訊息（若是核准/駁回，可自訂提示文字）
+  const userMsgText = actionType === "chat" 
+    ? text 
+    : actionType === "approve" ? "👍 [操作已核准，送交執行]" : "❌ [操作已駁回]";
 
-    setMessages((prev) => [
-      ...prev,
-      { id: userMsgId, role: "user", content: text },
-      { id: agentMsgId, role: "agent", content: "", isStreaming: true, statusText: "⏳ 思考中..." }
-    ]);
-    
-    setInput("");
-    setIsLoading(true);
+  const userMessage: Message = {
+    id: Date.now().toString(),
+    role: "user",
+    content: userMsgText,
+  };
 
-    try {
-      const res = await fetch("http://127.0.0.1:8000/api/v1/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: threadId,
-          message: text,
-          email: currentUser.email, // 👈 嚴格使用當前登入者的信箱
-          action: action,
-        }),
-      });
+  // 2. 建立 Agent 的初始串流節點（預設狀態為初始化大腦）
+  const agentMessageId = (Date.now() + 1).toString();
+  const initialAgentMessage: Message = {
+    id: agentMessageId,
+    role: "agent",
+    content: "",
+    statusText: "🧠 大腦正在接收請求...", // 👈 真實狀態文字
+    isStreaming: true,
+  };
 
-      if (!res.ok) throw new Error("伺服器連線失敗");
-      if (!res.body) throw new Error("無效的回傳串流");
+  // 更新訊息列表並開啟讀取狀態
+  setMessages((prev) => [...prev, userMessage, initialAgentMessage]);
+  setInput("");
+  setIsLoading(true);
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = ""; 
+  try {
+    // 3. 發起跨網域串流請求
+    const response = await fetch("http://127.0.0.1:8000/api/v1/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        thread_id: threadId || "demo-thread", // 確保有 Thread ID 綁定
+        message: text,
+        email: currentUser?.email || "",
+        action: actionType,
+      }),
+    });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+    if (!response.body) {
+      throw new Error("後端未回傳可讀取的資料串流 (ReadableStream)。");
+    }
 
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() || ""; 
+    // 4. 開啟企業級串流閱讀器
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = ""; // 行緩衝區，防止 SSE 斷包導致 JSON 解析出錯
 
-        for (const part of parts) {
-          if (part.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(part.slice(6));
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
 
-              setMessages((prev) => prev.map(msg => {
-                if (msg.id !== agentMsgId) return msg;
-                switch (data.type) {
-                  case "token": 
-                    return { ...msg, content: msg.content + data.content, statusText: undefined };
-                  case "status": 
-                    return { ...msg, statusText: data.content };
-                  case "suspend": 
-                    return { ...msg, isSuspended: true, isStreaming: false, statusText: undefined };
-                  case "finish": 
-                    return { ...msg, isStreaming: false, statusText: undefined };
-                  case "error":
-                    return { ...msg, content: msg.content + "\n\n❌ 發生錯誤：" + data.content, isStreaming: false };
-                  default:
-                    return msg;
-                }
-              }));
-            } catch (e) {
-              console.error("解析 SSE 封包失敗:", e, part);
-            }
+      // 將二進位 Byte 轉回 UTF-8 字串並併入緩衝區
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      
+      // 保留最後一行未完結的碎片
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data: ")) continue;
+
+        try {
+          // 擷取 data: 之後的純 JSON 字串
+          const rawJson = trimmed.slice(6);
+          const event = JSON.parse(rawJson);
+
+          // 🚦 5. 根據後端定義的 type 進行漸進式 UI 更新
+          switch (event.type) {
+            case "status":
+              // 軌道 A：更新 Agent 當前正在執行的真實工具或節點
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === agentMessageId ? { ...msg, statusText: event.content } : msg
+                )
+              );
+              break;
+
+            case "token":
+              // 軌道 B：打字機效果，將文字一個字一個字追加到對話框中
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === agentMessageId ? { ...msg, content: msg.content + event.content } : msg
+                )
+              );
+              break;
+
+            case "suspend":
+              // 觸發安全海關：系統被 LangGraph 強制凍結，顯示審批按鈕
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === agentMessageId
+                    ? { ...msg, isSuspended: true, statusText: "⏳ 觸發零信任防線：等待主管核准中" }
+                    : msg
+                )
+              );
+              break;
+
+            case "finish":
+              // 正常結束安全流程
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === agentMessageId ? { ...msg, isStreaming: false, statusText: "" } : msg
+                )
+              );
+              break;
+
+            case "error":
+              // 捕獲例外並呈現在對話中
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === agentMessageId
+                    ? { ...msg, content: msg.content + `\n\n❌ 系統異常: ${event.content}`, isStreaming: false }
+                    : msg
+                )
+              );
+              break;
           }
+        } catch (err) {
+          console.error("SSE 訊號行解析失敗:", trimmed, err);
         }
       }
-    } catch (error) {
-      setMessages((prev) => [
-        ...prev,
-        { id: Date.now().toString(), role: "agent", content: "❌ 連線到後端發生錯誤。" }
-      ]);
-    } finally {
-      setIsLoading(false);
     }
-  };
+  } catch (error) {
+    console.error("連線發送失敗:", error);
+    // 發生連線崩潰時的安全降級
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === agentMessageId
+          ? { ...msg, content: "❌ 無法連線至 IT 維運後端微服務，請確認後端 API 是否正常運作。", isStreaming: false, statusText: "" }
+          : msg
+      )
+    );
+  } finally {
+    setIsLoading(false);
+  }
+};
 
   // 畫面尚未驗證身分前，不渲染內容避免閃爍
   if (!currentUser) return null; 
@@ -197,11 +259,12 @@ export default function Home() {
                     ? "bg-amber-50 border-2 border-amber-200 rounded-tl-none" 
                     : "bg-white border border-gray-100 rounded-tl-none text-gray-800"
               }`}>
-                {msg.statusText && (
-                  <div className="text-xs text-blue-600 font-semibold mb-3 flex items-center gap-1 animate-pulse border-b border-blue-100 pb-2">
-                    <span>{msg.statusText}</span>
-                  </div>
-                )}
+                {msg.role === "agent" && msg.statusText && (
+                    <div className="flex items-center gap-2 text-xs font-medium text-blue-700 bg-blue-50 px-3 py-2 rounded-lg border border-blue-100 mb-2.5 animate-pulse w-fit shadow-sm">
+                      <RefreshCw className="w-3.5 h-3.5 text-blue-500 animate-spin" />
+                      <span>{msg.statusText}</span>
+                    </div>
+                  )}
                 <div className="prose prose-sm max-w-none leading-relaxed prose-p:my-1 prose-strong:text-blue-700">
                   <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>

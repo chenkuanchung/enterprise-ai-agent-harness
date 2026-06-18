@@ -199,8 +199,21 @@ async def chat_endpoint(request: ChatRequest):
                 if stream_type == "messages":
                     msg_chunk, metadata = chunk
                     if metadata.get("langgraph_node") == "agent" and msg_chunk.content:
-                        # 吐出每個文字
-                        yield f"data: {json.dumps({'type': 'token', 'content': msg_chunk.content})}\n\n"
+                        
+                        # 🛡️ 型別清洗：確保 Gemini 回傳的複雜結構被展平為純字串
+                        token_text = ""
+                        if isinstance(msg_chunk.content, str):
+                            token_text = msg_chunk.content
+                        elif isinstance(msg_chunk.content, list):
+                            for item in msg_chunk.content:
+                                if isinstance(item, str):
+                                    token_text += item
+                                elif isinstance(item, dict) and "text" in item:
+                                    token_text += item["text"]
+                        
+                        # 只有當萃取出實質文字時，才推送到前端
+                        if token_text:
+                            yield f"data: {json.dumps({'type': 'token', 'content': token_text})}\n\n"
                 
                 # 【軌道 B】捕捉節點與工具狀態 (讓前端顯示 "正在呼叫工具...")
                 elif stream_type == "updates":

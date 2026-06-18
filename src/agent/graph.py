@@ -37,7 +37,7 @@ def make_agent_app(mcp_tools: List, checkpointer=None):
 
     # 確保在運行期擁有完整環境變數
     llm = ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash",
+        model="gemini-3.1-flash-lite",
         temperature=0.0,
         google_api_key=os.getenv("GOOGLE_API_KEY")
     )
