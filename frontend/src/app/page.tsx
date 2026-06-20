@@ -81,16 +81,49 @@ export default function Home() {
     setInput("");
   };
 
-  // 切換歷史對話房間 (目前 MVP 先單純切換 Thread ID 並清空畫面，未來可再串接撈取歷史訊息 API)
-  const switchThread = (selectedThreadId: string) => {
+  // 🔄 切換歷史對話房間並載入上下文
+  const switchThread = async (selectedThreadId: string) => {
     setThreadId(selectedThreadId);
+    setIsLoading(true);
+    
+    // 先顯示載入中的過場訊息
     setMessages([
       {
-        id: Date.now().toString(),
+        id: "loading",
         role: "agent",
-        content: `🔄 已切換至對話空間：\`${selectedThreadId}\`\n\n(提示：正在載入歷史對話上下文...)`,
+        content: `🔄 正在從伺服器載入歷史對話上下文 (\`${selectedThreadId}\`)...`,
+        statusText: "撈取記憶體中..."
       }
     ]);
+
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/v1/chat/history?thread_id=${selectedThreadId}`);
+      const data = await res.json();
+      
+      if (data.status === "success" && data.messages.length > 0) {
+        // 成功撈取歷史訊息，直接覆蓋畫面
+        setMessages(data.messages);
+      } else {
+        // 該房間沒有歷史訊息（防呆）
+        setMessages([
+          {
+            id: Date.now().toString(),
+            role: "agent",
+            content: `歡迎回到對話空間：\`${selectedThreadId}\`\n\n請問有什麼我可以繼續幫忙的嗎？`,
+          }
+        ]);
+      }
+    } catch (error) {
+      setMessages([
+        {
+          id: "error",
+          role: "agent",
+          content: `❌ 無法連線至伺服器讀取歷史紀錄。`,
+        }
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleLogout = () => {
@@ -102,9 +135,14 @@ export default function Home() {
   const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat") => {
     if (!text.trim() && actionType === "chat") return;
 
+    // 如果是點擊按鈕，立刻把畫面上所有舊按鈕消除，防止重複點擊
+    if (actionType === "approve" || actionType === "reject") {
+      setMessages((prev) => prev.map(msg => ({ ...msg, isSuspended: false })));
+    }
+
     const userMsgText = actionType === "chat" 
       ? text 
-      : actionType === "approve" ? "✅ [操作已核准，送交執行]" : "❌ [操作已駁回]";
+      : actionType === "approve" ? "✅ [操作已確認授權]" : "❌ [操作已取消]";
 
     const userMessage: Message = { id: Date.now().toString(), role: "user", content: userMsgText };
     const agentMessageId = (Date.now() + 1).toString();
@@ -139,11 +177,12 @@ export default function Home() {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        
+        const events = buffer.split("\n\n"); 
+        buffer = events.pop() || "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
+        for (const eventStr of events) {
+          const trimmed = eventStr.trim();
           if (!trimmed.startsWith("data: ")) continue;
 
           try {
@@ -282,21 +321,13 @@ export default function Home() {
                   </div>
                   {msg.isSuspended && (
                     <div className="mt-4 flex gap-3 pt-3 border-t border-amber-200">
-                      {currentUser?.role === "admin" ? (
-                        <>
-                          <button onClick={() => sendMessage("✅ 我已了解風險，授權系統放行操作。", "approve")} className="flex items-center gap-1 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm">
-                            <CheckCircle className="w-4 h-4" /> 主管核准
-                          </button>
-                          <button onClick={() => sendMessage("❌ 操作已被駁回，請取消任務。", "reject")} className="flex items-center gap-1 bg-white text-red-600 hover:bg-red-50 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-red-200">
-                            <XCircle className="w-4 h-4" /> 駁回
-                          </button>
-                        </>
-                      ) : (
-                        <div className="text-sm text-amber-700 font-medium flex items-center gap-2">
-                          <AlertTriangle className="w-4 h-4 text-amber-500" />
-                          已凍結：等待 IT 主管簽核
-                        </div>
-                      )}
+                      {/* 拔除 role === "admin" 的判斷，按鈕呈現給當前對話者 */}
+                      <button onClick={() => sendMessage("✅ 我已確認風險，授權執行此操作。", "approve")} className="flex items-center gap-1 bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm">
+                        <AlertTriangle className="w-4 h-4" /> 確認授權執行
+                      </button>
+                      <button onClick={() => sendMessage("❌ 操作已取消。", "reject")} className="flex items-center gap-1 bg-white text-gray-600 hover:bg-gray-50 px-4 py-2 rounded-lg text-sm font-medium transition-colors border border-gray-200">
+                        <XCircle className="w-4 h-4" /> 取消操作
+                      </button>
                     </div>
                   )}
                 </div>

@@ -43,10 +43,6 @@ BASE_PROMPT = """你是一位專業的企業級 IT 維運助理 (ITOps Agent)。
 {skills_content}
 """
 
-# 在模組載入時，將讀取到的 skills.md 內容注入到 Prompt 中
-SYSTEM_PROMPT = BASE_PROMPT.format(skills_content=load_skills())
-
-
 def make_agent_app(mcp_tools: List, checkpointer=None):
     """
     企業級 Agent 工廠：負責接收受控的遠端工具鏈，動態建構並編譯 LangGraph 狀態機。
@@ -74,13 +70,19 @@ def make_agent_app(mcp_tools: List, checkpointer=None):
         messages = state["messages"]
         # 從 State 取出前端傳來的信箱
         email = state.get("email", "未知") 
+
+        # 👈 【熱更新修復】：每次思考前，即時讀取最新的 skills.md
+        current_skills = load_skills()
         
-        # 告訴大腦使用者的信箱
-        dynamic_prompt = SYSTEM_PROMPT + f"\n\n【當前環境上下文】\n目前登入系統的員工信箱為: {email}"
-        
+        # 組合最新的 System Prompt
+        dynamic_system_prompt = BASE_PROMPT.format(skills_content=current_skills)
+
+        # 告訴大腦使用者的信箱上下文
+        dynamic_prompt = dynamic_system_prompt + f"\n\n【當前環境上下文】\n目前登入系統的員工信箱為: {email}"
+
         filtered_messages = [m for m in messages if not isinstance(m, SystemMessage)]
         invoke_messages = [SystemMessage(content=dynamic_prompt)] + filtered_messages
-            
+
         response = await llm_with_tools.ainvoke(invoke_messages)
         return {"messages": [response]}
 

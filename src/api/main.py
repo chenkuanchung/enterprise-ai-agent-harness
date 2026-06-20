@@ -4,7 +4,7 @@ load_dotenv(override=True)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
 import uvicorn
 import traceback
 from contextlib import asynccontextmanager
@@ -15,7 +15,7 @@ from src.agent.graph import make_agent_app
 from src.core.config.settings import settings
 from src.db.session import AsyncSessionLocal 
 from sqlalchemy.future import select
-from src.db.models import User, ChatThread
+from src.db.models import User, ChatThread, Device
 
 # LangGraph Postgres 記憶體相關套件
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -171,20 +171,73 @@ async def chat_endpoint(request: ChatRequest):
 
             if is_suspended:
                 if request.action == "approve":
-                    yield f"data: {json.dumps({'type': 'status', 'content': '✅ 授權成功，正在喚醒大腦執行任務...'})}\n\n"
-                    input_data = None 
+                    # 🛡️ 企業級 ABAC 防線：不看 Role，看「動態資源權限」
+                    
+                    # 1. 取出 AI 當下被凍結的「危險工具呼叫」
+                    last_msg = current_state.values.get("messages", [])[-1]
+                    tool_calls = getattr(last_msg, "tool_calls", [])
+                    
+                    if not tool_calls:
+                        yield f"data: {json.dumps({'type': 'error', 'content': '無法識別待執行的操作。'})}\n\n"
+                        return
+
+                    async with AsyncSessionLocal() as session:
+                        # 2. 查詢當前請求的員工
+                        user_res = await session.execute(select(User).filter_by(email=request.email))
+                        user_obj = user_res.scalars().first()
+
+                        if not user_obj:
+                            yield f"data: {json.dumps({'type': 'error', 'content': '身分驗證失敗。'})}\n\n"
+                            return
+                        
+                        # 3. 根據不同的危險工具，實作不同的業務權限檢驗
+                        all_tools_validated = True  # 預設防線狀態
+
+                        for tool in tool_calls:
+                            tool_name = tool["name"]
+                            args = tool.get("args", {})
+
+                            if tool_name == "remote_wipe_device":
+                                device_id = args.get("device_id")
+                                device_res = await session.execute(select(Device).filter_by(device_id=device_id))
+                                device = device_res.scalars().first()
+                                
+                                if not device:
+                                    yield f"data: {json.dumps({'type': 'error', 'content': f'找不到設備 {device_id}。'})}\n\n"
+                                    return
+
+                                if device.owner_id != user_obj.id:
+                                    error_msg = f"❌ 資安攔截：您 ({user_obj.email}) 非設備 {device_id} 之擁有者，無權授權抹除操作。"
+                                    yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
+                                    return
+                                    
+                            # 如果未來有新工具，寫在這裡 elif...
+                            
+                            else:
+                                # 🛑 觸發 Default Deny：遇到系統不認識的敏感工具，一律擋下！
+                                all_tools_validated = False
+                                yield f"data: {json.dumps({'type': 'error', 'content': f'❌ 資安攔截：未知的敏感操作 ({tool_name})，系統拒絕放行。'})}\n\n"
+                                return
+
+                        # 4. 驗證全數通過，正式放行大腦執行
+                        if all_tools_validated:
+                            yield f"data: {json.dumps({'type': 'status', 'content': '✅ 權限驗證通過，授權系統放行操作...'})}\n\n"
+                            input_data = None
+
                 elif request.action == "reject":
-                    yield f"data: {json.dumps({'type': 'status', 'content': '❌ 已駁回，正在退回大腦重新思考...'})}\n\n"
+                    # 👈 【保留原本的駁回邏輯】：讓 LangGraph 知道操作被取消了
+                    yield f"data: {json.dumps({'type': 'status', 'content': '❌ 已取消，正在退回大腦重新思考...'})}\n\n"
                     last_msg = current_state.values.get("messages", [])[-1]
                     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                         tool_call = last_msg.tool_calls[0]
                         reject_msg = ToolMessage(
                             tool_call_id=tool_call["id"],
                             name=tool_call["name"],
-                            content="⚠️ 此操作已被主管或使用者手動駁回與取消。"
+                            content="⚠️ 此操作已被使用者手動取消與駁回。"
                         )
                         await agent_app.aupdate_state(config, {"messages": [reject_msg]}, as_node="sensitive_tools")
                     input_data = None
+
                 else:
                     yield f"data: {json.dumps({'type': 'error', 'content': '系統處於凍結狀態，請先點擊授權或駁回。'})}\n\n"
                     return
@@ -276,6 +329,70 @@ async def get_user_threads(email: str):
             return {"status": "success", "threads": thread_list}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/api/v1/chat/history")
+async def get_chat_history(thread_id: str):
+    """
+    [前端 UI 支援] 根據 Thread ID 從 LangGraph 記憶體中完整還原歷史對話
+    """
+    global agent_app
+    if not agent_app:
+        raise HTTPException(status_code=503, detail="Agent 尚未初始化")
+
+    try:
+        # 1. 取得 LangGraph 針對該 thread 的完整狀態
+        config = {"configurable": {"thread_id": thread_id}}
+        state = await agent_app.aget_state(config)
+
+        # 若查無歷史紀錄
+        if not state or not hasattr(state, "values") or "messages" not in state.values:
+            return {"status": "success", "messages": []}
+
+        raw_messages = state.values["messages"]
+        formatted_messages = []
+
+        # 2. 濾除不必要的系統訊息，並轉換為前端需要的格式
+        for idx, msg in enumerate(raw_messages):
+            if isinstance(msg, SystemMessage) or isinstance(msg, ToolMessage):
+                continue  # 前端不需要顯示 System Prompt 與純工具回傳值
+
+            role = "user" if isinstance(msg, HumanMessage) else "agent"
+
+            # 提取內容字串
+            content = ""
+            if isinstance(msg.content, str):
+                content = msg.content
+            elif isinstance(msg.content, list):
+                for item in msg.content:
+                    if isinstance(item, str):
+                        content += item
+                    elif isinstance(item, dict) and "text" in item:
+                        content += item["text"]
+
+            # 若 AI 只有呼叫工具而沒有文字內容，則不顯示該對話氣泡
+            if not content.strip():
+                continue
+
+            formatted_messages.append({
+                "id": f"hist-{idx}",
+                "role": role,
+                "content": content
+            })
+
+        # 3. 🎯 核心體驗：如果該對話目前處於「凍結」狀態，則為最後一句話加上 isSuspended 標記
+        is_suspended = len(state.next) > 0
+        if is_suspended and formatted_messages:
+            formatted_messages[-1]["isSuspended"] = True
+
+        return {
+            "status": "success", 
+            "messages": formatted_messages,
+            "is_suspended": is_suspended
+        }
+
+    except Exception as e:
+        print("❌ [History Error]:", e)
+        raise HTTPException(status_code=500, detail="無法撈取歷史對話")
 
 if __name__ == "__main__":
     uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=True)

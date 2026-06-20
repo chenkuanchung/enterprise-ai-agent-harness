@@ -253,36 +253,95 @@ async def remote_wipe_device(device_id: str) -> str:
 # ==========================================
 
 async def _calculate_chain(session, user: User, tier: int) -> list:
-    """[內部共用邏輯] 產生雙軌簽核名單 (不依賴 AI，由純程式碼保證合規)"""
+    """[企業實務版] 支援「越級簽核 / 彈性遞補」的雙軌簽核名單 (包含 Tier 4 最高層級)"""
     chain = []
     step = 1
 
-    # Tier 2 以上：User 經理 -> IT 經理
+    # ==========================================
+    # 軌道一：User 端 (業務需求核准)
+    # 邏輯：順著 manager_id 往上爬
+    # ==========================================
     if tier >= 2:
         if user.manager_id:
             user_mgr = await session.execute(select(User).filter_by(id=user.manager_id))
             mgr = user_mgr.scalars().first()
             if mgr:
-                chain.append({"step": step, "role_type": "User 直屬主管", "approver": mgr})
+                chain.append({"step": step, "role_type": "User 端直屬/最高主管", "approver": mgr})
                 step += 1
-        
-        # 尋找 IT 經理 (實務上查特定部門，此處以特定 title 或 role 模擬)
-        it_mgr = await session.execute(select(User).filter_by(role="it_manager"))
-        it = it_mgr.scalars().first()
-        if it:
-            chain.append({"step": step, "role_type": "IT 維運主管", "approver": it})
+            else:
+                raise Exception("無法生成簽核鏈：資料庫遺失您的主管資料。")
+        else:
+            # 申請人無主管 (本身已是最高層)
+            chain.append({"step": step, "role_type": "User 端 (系統判定免簽/最高層)", "approver": user})
             step += 1
 
-    # Tier 3 以上：User 處長 -> IT 處長
-    if tier >= 3:
-        # 略過複雜的主管樹查詢，直接指定 Admin 級別代表處長
-        it_admin = await session.execute(select(User).filter_by(role="admin"))
-        admin = it_admin.scalars().first()
-        if admin:
-            chain.append({"step": step, "role_type": "IT 處長 (技術與資安會簽)", "approver": admin})
+    # ==========================================
+    # 軌道二：IT 端 (技術、資安與高階決行)
+    # 邏輯：使用業務頭銜，支援找不到人時往上找，並嚴格去重
+    # ==========================================
+    
+    # 定義職級尋找順序 (權限由小到大)
+    async def find_it_approver(preferred_roles: list) -> User:
+        for role in preferred_roles:
+            res = await session.execute(select(User).filter_by(role=role))
+            approver = res.scalars().first()
+            if approver:
+                return approver
+        return None
+
+    if tier >= 2:
+        it_mgr = await find_it_approver(["it_manager", "it_director"])
+        if it_mgr:
+            chain.append({"step": step, "role_type": "IT 維運審查", "approver": it_mgr})
             step += 1
-            
-    # Tier 4 此處可繼續堆疊 VP、GM...
+        else:
+            raise Exception("系統異常：找不到任何 IT 經理或處長來執行 Tier 2 簽核。")
+
+    if tier >= 3:
+        it_director = await find_it_approver(["it_director", "vp_it", "cio"])
+        if it_director:
+            # 【去重邏輯】如果上一關代簽的主管與此關相同，免重複簽核
+            last_approver = chain[-1]["approver"]
+            if last_approver.id != it_director.id:
+                chain.append({"step": step, "role_type": "IT 處長/高階資安審查", "approver": it_director})
+                step += 1
+        else:
+            raise Exception("系統異常：找不到具備 IT 處長 (it_director) 級別以上之主管來執行 Tier 3 簽核。")
+
+    # ==========================================
+    # 軌道三：C-Level 企業高階決行 (Tier 4 專屬)
+    # ==========================================
+    if tier >= 4:
+        # 1. 副總裁 (VP) 會簽
+        vp = await find_it_approver(["vp", "vp_it", "cio"])
+        if vp:
+            last_approver = chain[-1]["approver"]
+            if last_approver.id != vp.id:
+                chain.append({"step": step, "role_type": "副總 (VP) 決策審查", "approver": vp})
+                step += 1
+        else:
+            raise Exception("系統異常：Tier 4 極高風險專案必須由 副總(VP) 級別以上主管簽核，但系統查無此角色。")
+
+        # 2. 總經理 (GM) 會簽
+        gm = await find_it_approver(["gm", "ceo"])
+        if gm:
+            last_approver = chain[-1]["approver"]
+            if last_approver.id != gm.id:
+                chain.append({"step": step, "role_type": "總經理 (GM) 決策審查", "approver": gm})
+                step += 1
+        else:
+            raise Exception("系統異常：Tier 4 極高風險專案必須由 總經理(GM) 簽核，但系統查無此角色。")
+
+        # 3. 董事長 (Chairman) 最終決行
+        chairman = await find_it_approver(["chairman"])
+        if chairman:
+            last_approver = chain[-1]["approver"]
+            if last_approver.id != chairman.id:
+                chain.append({"step": step, "role_type": "董事長 (Chairman) 最終決行", "approver": chairman})
+                step += 1
+        else:
+            raise Exception("系統異常：Tier 4 極高風險專案必須由 董事長(Chairman) 最終決行，但系統查無此角色。")
+
     return chain
 
 @mcp.tool()
@@ -404,7 +463,28 @@ async def process_approval(ticket_id: str, action: str, comments: str = "") -> s
                 else:
                     incident.status = "Approved" # 全部簽完
                     msg = "已核准。此工單的所有簽核皆已完成，可開始執行維運操作。"
+
+            # 退回前一關的邏輯
+            elif action == "reject_previous":
+                if current_step.step_order > 1:
+                    # 找出前一關
+                    prev_step_res = await session.execute(
+                        select(ApprovalStep)
+                        .filter_by(incident_id=incident.id, step_order=current_step.step_order - 1)
+                    )
+                    prev_step = prev_step_res.scalars().first()
                     
+                    if prev_step:
+                        # 將前一關狀態改回 Pending，目前這關改為 Waiting
+                        prev_step.status = "Pending"
+                        current_step.status = "Waiting"
+                        current_step.comments = comments
+                        msg = "已將工單退回給前一關主管重新審核。"
+                    else:
+                        return format_error("找不到前一關的紀錄，無法退回。")
+                else:
+                    return format_error("目前已經是第一關，無法再退回前一關。若要退件，請選擇 '退回申請人'。")
+
             elif action == "reject_applicant":
                 current_step.status = "Rejected"
                 current_step.comments = comments
