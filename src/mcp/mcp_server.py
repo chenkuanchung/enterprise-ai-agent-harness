@@ -4,10 +4,12 @@ from sqlalchemy.future import select
 
 # 引入資料庫連線與模型
 from src.db.session import AsyncSessionLocal
-from src.db.models import User, Device, AuditLog, CMDBRelation
+from src.db.models import User, Device, AuditLog, CMDBRelation, Incident, ChatThread, ApprovalStep
 from src.core.config.settings import settings
-from src.db.models import Incident
 import uuid
+from enum import Enum
+from typing import Optional
+from sqlalchemy import asc
 
 # 初始化 FastMCP 伺服器
 mcp = FastMCP("GlobalTech-ITOps-Tools", host="0.0.0.0", port=8001)
@@ -181,8 +183,38 @@ async def update_ticket_status(ticket_id: str, status: str, resolution_notes: st
             if resolution_notes:
                 inc_obj.resolution_notes = resolution_notes
             
+            # === Phase 2: 自動建立主管通知 Thread ===
+            if status == "Pending_Approval":
+                # 1. 找出申請人與其直屬主管
+                user_res = await session.execute(select(User).filter_by(id=inc_obj.user_id))
+                applicant = user_res.scalars().first()
+                
+                if applicant and applicant.manager_id:
+                    thread_title = f"[系統通知] 待簽核工單 {ticket_id}"
+                    
+                    # 2. 檢查是否已經建過這個通知，防止重複發送
+                    existing_thread = await session.execute(
+                        select(ChatThread).filter_by(user_id=applicant.manager_id, title=thread_title)
+                    )
+                    
+                    if not existing_thread.scalars().first():
+                        # 3. 建立新的對話房間給主管
+                        new_thread = ChatThread(
+                            thread_id=f"sys-notify-{ticket_id}",
+                            tenant_id=inc_obj.tenant_id,
+                            user_id=applicant.manager_id,
+                            title=thread_title
+                        )
+                        session.add(new_thread)
+            
             await session.commit()
-            return format_success({"ticket_id": ticket_id, "new_status": status, "message": "工單狀態已更新"})
+            
+            # 若為 Pending_Approval，回傳給 Agent 的訊息可以順便告訴它主管已收到通知
+            msg = "工單狀態已更新。"
+            if status == "Pending_Approval":
+                msg += "已自動在後台建立系統通知發送給簽核主管。"
+                
+            return format_success({"ticket_id": ticket_id, "new_status": status, "message": msg})
         except Exception as e:
             await session.rollback()
             return format_error(f"更新工單失敗: {str(e)}")
@@ -215,6 +247,238 @@ async def remote_wipe_device(device_id: str) -> str:
         except Exception as e:
             await session.rollback()
             return format_error(f"設備抹除失敗: {str(e)}")
+        
+# ==========================================
+# 企業級 BPM 簽核引擎與工具 (BPM Engine)
+# ==========================================
+
+async def _calculate_chain(session, user: User, tier: int) -> list:
+    """[內部共用邏輯] 產生雙軌簽核名單 (不依賴 AI，由純程式碼保證合規)"""
+    chain = []
+    step = 1
+
+    # Tier 2 以上：User 經理 -> IT 經理
+    if tier >= 2:
+        if user.manager_id:
+            user_mgr = await session.execute(select(User).filter_by(id=user.manager_id))
+            mgr = user_mgr.scalars().first()
+            if mgr:
+                chain.append({"step": step, "role_type": "User 直屬主管", "approver": mgr})
+                step += 1
+        
+        # 尋找 IT 經理 (實務上查特定部門，此處以特定 title 或 role 模擬)
+        it_mgr = await session.execute(select(User).filter_by(role="it_manager"))
+        it = it_mgr.scalars().first()
+        if it:
+            chain.append({"step": step, "role_type": "IT 維運主管", "approver": it})
+            step += 1
+
+    # Tier 3 以上：User 處長 -> IT 處長
+    if tier >= 3:
+        # 略過複雜的主管樹查詢，直接指定 Admin 級別代表處長
+        it_admin = await session.execute(select(User).filter_by(role="admin"))
+        admin = it_admin.scalars().first()
+        if admin:
+            chain.append({"step": step, "role_type": "IT 處長 (技術與資安會簽)", "approver": admin})
+            step += 1
+            
+    # Tier 4 此處可繼續堆疊 VP、GM...
+    return chain
+
+@mcp.tool()
+async def evaluate_approval_chain(email: str, tier: int) -> str:
+    """
+    [預覽工具] 查詢該風險等級 (Tier) 需要的簽核鏈。開單前必呼叫。
+    """
+    if tier <= 1:
+        return format_success({"message": "Tier 1 低風險，免簽核，可直接處理。"})
+        
+    async with AsyncSessionLocal() as session:
+        try:
+            user_res = await session.execute(select(User).filter_by(email=email))
+            user = user_res.scalars().first()
+            if not user:
+                return format_error("找不到申請人。")
+                
+            chain = await _calculate_chain(session, user, tier)
+            approver_names = " ➡️ ".join([f"{c['approver'].full_name}({c['role_type']})" for c in chain])
+            
+            return format_success({
+                "message": f"此申請需經過 {len(chain)} 關簽核。流程為：{approver_names}。請詢問使用者是否確認送簽？"
+            })
+        except Exception as e:
+            return format_error(f"查詢失敗: {str(e)}")
+
+@mcp.tool()
+async def submit_for_approval(ticket_id: str, email: str, tier: int) -> str:
+    """
+    [開單工具] 使用者確認後，將工單正式送入 BPM 簽核流程。
+    """
+    if tier <= 1:
+        return format_error("Tier 1 無需送簽，請直接呼叫 update_ticket_status 結案。")
+
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. 取得工單與使用者
+            inc_res = await session.execute(select(Incident).filter_by(ticket_id=ticket_id))
+            incident = inc_res.scalars().first()
+            user_res = await session.execute(select(User).filter_by(email=email))
+            user = user_res.scalars().first()
+            
+            if not incident or not user:
+                return format_error("工單或使用者不存在。")
+
+            # 2. 由後端程式碼「重新計算」簽核名單 (零信任，不接受 AI 傳入名單)
+            chain = await _calculate_chain(session, user, tier)
+            
+            # 3. 寫入 ApprovalStep 資料表
+            for c in chain:
+                step = ApprovalStep(
+                    tenant_id=incident.tenant_id,
+                    incident_id=incident.id,
+                    step_order=c["step"],
+                    role_type=c["role_type"],
+                    approver_id=c["approver"].id,
+                    status="Pending" if c["step"] == 1 else "Waiting" # 第一關設為 Pending，其餘等待中
+                )
+                session.add(step)
+            
+            # 4. 更新工單狀態與建立第一關的系統通知
+            incident.status = "Pending_Approval"
+            
+            first_approver = chain[0]["approver"]
+            thread_title = f"[系統通知] 待簽核工單 {ticket_id}"
+            new_thread = ChatThread(
+                thread_id=f"sys-notify-{ticket_id}-{uuid.uuid4().hex[:6]}",
+                tenant_id=incident.tenant_id,
+                user_id=first_approver.id,
+                title=thread_title
+            )
+            session.add(new_thread)
+            
+            await session.commit()
+            return format_success({"message": f"工單已成功送簽。已自動通知第一關主管：{first_approver.full_name}。"})
+            
+        except Exception as e:
+            await session.rollback()
+            return format_error(f"送簽失敗: {str(e)}")
+
+@mcp.tool()
+async def process_approval(ticket_id: str, action: str, comments: str = "") -> str:
+    """
+    [審批工具] 處理簽核動作。
+    action 支援: 'approve' (同意), 'reject_previous' (退回前一關), 'reject_applicant' (退回申請人)
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            inc_res = await session.execute(select(Incident).filter_by(ticket_id=ticket_id))
+            incident = inc_res.scalars().first()
+            if not incident:
+                return format_error("找不到該工單。")
+
+            # 找出目前卡住的「那一關」
+            step_res = await session.execute(
+                select(ApprovalStep)
+                .filter_by(incident_id=incident.id, status="Pending")
+                .order_by(asc(ApprovalStep.step_order))
+            )
+            current_step = step_res.scalars().first()
+            
+            if not current_step:
+                return format_error("此工單目前沒有等待您簽核的關卡。")
+
+            if action == "approve":
+                current_step.status = "Approved"
+                current_step.comments = comments
+                
+                # 尋找下一關
+                next_step_res = await session.execute(
+                    select(ApprovalStep)
+                    .filter_by(incident_id=incident.id, step_order=current_step.step_order + 1)
+                )
+                next_step = next_step_res.scalars().first()
+                
+                if next_step:
+                    next_step.status = "Pending"
+                    msg = "已核准。流程將進入下一關。"
+                else:
+                    incident.status = "Approved" # 全部簽完
+                    msg = "已核准。此工單的所有簽核皆已完成，可開始執行維運操作。"
+                    
+            elif action == "reject_applicant":
+                current_step.status = "Rejected"
+                current_step.comments = comments
+                incident.status = "Open" # 退回原點
+                msg = "已退回給申請人。"
+                
+            await session.commit()
+            return format_success({"message": msg})
+            
+        except Exception as e:
+            await session.rollback()
+            return format_error(f"操作失敗: {str(e)}")
+
+# ==========================================
+# 企業級強型別定義
+# ==========================================
+class TicketStatus(str, Enum):
+    OPEN = "Open"
+    PENDING_APPROVAL = "Pending_Approval"
+    RESOLVED = "Resolved"
+    CLOSED = "Closed"
+
+# ==========================================
+# 透過 MCP 協定暴露的通用查詢工具
+# ==========================================
+@mcp.tool()
+async def query_tickets(
+    status: Optional[TicketStatus] = None,
+    assignee_email: Optional[str] = None,
+    limit: int = 10
+) -> str:
+    """
+    [核心通用工具] 根據條件查詢 ITSM 工單清單。
+    
+    使用情境指引：
+    1. 當主管詢問「我有待簽核的工單嗎？」：傳入 status="Pending_Approval"。若有指定主管信箱，可傳入 assignee_email。
+    2. 當使用者詢問「我目前處理中的工單？」：傳入 status="Open" 與該使用者的 assignee_email。
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            # 建構動態查詢條件
+            query = select(Incident)
+            
+            if status:
+                query = query.filter_by(status=status.value)
+                
+            # 若未來 Incident 表加入 assignee_id，可在此處轉換 email 並加入 filter
+            # if assignee_email:
+            #     user_res = await session.execute(select(User).filter_by(email=assignee_email))
+            #     user = user_res.scalars().first()
+            #     if user:
+            #         query = query.filter_by(assignee_id=user.id)
+            
+            query = query.limit(limit)
+            result = await session.execute(query)
+            tickets = result.scalars().all()
+            
+            if not tickets:
+                return format_success({"message": "依據您的條件，目前查無任何工單。"})
+            
+            # 整理回傳格式
+            ticket_list = [
+                {
+                    "ticket_id": t.ticket_id, 
+                    "status": t.status,
+                    "issue_description": t.issue_description, 
+                    "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                } 
+                for t in tickets
+            ]
+            return format_success({"tickets": ticket_list, "count": len(ticket_list)})
+            
+        except Exception as e:
+            return format_error(f"工單查詢異常: {str(e)}")
 
 if __name__ == "__main__":
     # 使用 FastMCP 內建的 SSE 傳輸層啟動伺服器

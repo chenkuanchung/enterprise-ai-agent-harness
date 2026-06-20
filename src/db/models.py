@@ -151,3 +151,52 @@ class AuditLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     tenant = relationship("Tenant")
+
+
+class ChatThread(Base):
+    """對話紀錄 (LLMOps 領域：支援歷史對話與主動通知)"""
+    __tablename__ = "chat_threads"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    thread_id = Column(String(100), unique=True, index=True, nullable=False)  # 對應 LangGraph 的 thread_id
+    
+    # 零信任優化：對話紀錄綁定租戶與員工
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    title = Column(String(255), nullable=False, default="新對話")
+    is_active = Column(Boolean, default=True)  # 若使用者刪除對話，則設為 False
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User", backref="chat_threads")
+    tenant = relationship("Tenant")
+
+
+class ApprovalStep(Base):
+    """BPM 簽核關卡 (記錄每張工單在各層級的審批狀態)"""
+    __tablename__ = "approval_steps"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    incident_id = Column(UUID(as_uuid=True), ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    # 關卡順序與角色定義
+    step_order = Column(Integer, nullable=False)  # 第幾關 (例如: 1, 2, 3)
+    role_type = Column(String(50), nullable=False) # 關卡名稱 (例如: "User 直屬經理", "IT 處長")
+    
+    # 負責簽核的主管
+    approver_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    
+    # 狀態: Pending(等待中), Approved(已核准), Rejected(已退回), Skipped(略過)
+    status = Column(String(20), nullable=False, default="Pending")
+    comments = Column(Text, nullable=True) # 核准備註或退簽理由
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    # 建立關聯
+    incident = relationship("Incident", backref="approval_steps")
+    approver = relationship("User")
+    tenant = relationship("Tenant")

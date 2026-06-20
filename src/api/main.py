@@ -15,7 +15,7 @@ from src.agent.graph import make_agent_app
 from src.core.config.settings import settings
 from src.db.session import AsyncSessionLocal 
 from sqlalchemy.future import select
-from src.db.models import User
+from src.db.models import User, ChatThread
 
 # LangGraph Postgres 記憶體相關套件
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -243,5 +243,39 @@ async def chat_endpoint(request: ChatRequest):
     # 使用 FastAPI 的 StreamingResponse 回傳 SSE 格式
     return StreamingResponse(event_generator(), media_type="text/event-stream")
     
+@app.get("/api/v1/threads")
+async def get_user_threads(email: str):
+    """
+    [前端 UI 支援] 取得特定使用者的所有對話紀錄 (包含系統主動通知)
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. 驗證使用者
+            user_res = await session.execute(select(User).filter_by(email=email))
+            user_obj = user_res.scalars().first()
+            if not user_obj:
+                raise HTTPException(status_code=404, detail="找不到該使用者")
+
+            # 2. 撈取對話紀錄並依更新時間排序
+            threads_res = await session.execute(
+                select(ChatThread)
+                .filter_by(user_id=user_obj.id, is_active=True)
+                .order_by(ChatThread.updated_at.desc())
+            )
+            threads = threads_res.scalars().all()
+
+            thread_list = [
+                {
+                    "thread_id": t.thread_id,
+                    "title": t.title,
+                    "updated_at": t.updated_at.strftime("%Y-%m-%d %H:%M")
+                }
+                for t in threads
+            ]
+
+            return {"status": "success", "threads": thread_list}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=True)

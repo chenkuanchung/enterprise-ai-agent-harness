@@ -8,23 +8,44 @@ from langgraph.prebuilt import ToolNode
 from src.rag.knowledge_base import search_it_sop
 from src.agent.state import ITOpsAgentState
 
-# 【企業級維運大腦守則】
-SYSTEM_PROMPT = """你是一位專業的 IT 維運助理 (ITOps Agent)。
-你的職責是協助員工排除技術問題。
+# ==========================================
+# 動態載入技能檔 (Skills Injection)
+# ==========================================
+def load_skills() -> str:
+    """
+    在系統啟動時，動態讀取 skills.md 作為大腦的絕對行為守則。
+    這樣未來修改流程，只需改 Markdown，不用動 Python 程式碼。
+    """
+    # 取得專案根目錄下的 docs/skills.md 路徑 (假設 graph.py 在 src/agent/ 下)
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    skills_path = os.path.join(base_dir, "docs", "skills.md")
+    
+    try:
+        with open(skills_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        print(f"⚠️ [警告] 無法載入 skills.md: {e}")
+        return "【警告：遺失技能檔，請要求工程師修復】"
 
-【企業級維運處理守則】：
-1. 查詢規定 (RAG)：遇到任何不確定的規定或SOP，必須優先使用 search_it_sop 工具。
-2. 開單時機 (Ticketing)：
-   - 若使用者僅是「一般問題諮詢」或「查詢規定」，直接回答即可，【絕對不要】開立工單。
-   - 若使用者要求「執行變更、申請軟體、排除故障」，請務必呼叫 create_ticket 建立工單追蹤。
-3. 狀態流轉與確認 (Status Lifecycle)：
-   - 執行修復動作後，請將工單狀態更新為 'Resolved'，並主動詢問使用者是否解決。
-   - 收到正向回覆後，才能將狀態更新為 'Closed'。
-4. 高風險防護 (HITL)：
-   - 處理涉及安全風險的操作 (如 Tier 4 軟體、遠端抹除) 時，請嚴格遵守【兩階段確認流程】：
-     👉 第一步：先呼叫 create_ticket 建立工單。然後向使用者列出工單編號與申請內容，並【主動詢問】：「請問是否確認送交主管審批？」。(此時不可呼叫 update_ticket_status)
-     👉 第二步：必須收到使用者明確的「確認」回覆後，才能呼叫 update_ticket_status 將狀態改為 'Pending_Approval'。
+# ==========================================
+# 組合最終的大腦系統提示詞 (System Prompt)
+# ==========================================
+BASE_PROMPT = """你是一位專業的企業級 IT 維運助理 (ITOps Agent)。
+你的核心職責是協助員工排除技術問題，並嚴格把關資安與簽核流程。
+
+【核心運作邏輯】：
+1. 遇到不確定的企業規定或風險分級 (Tier)，必須優先呼叫 `search_it_sop` 工具查詢法規。
+2. 絕對禁止自行猜測簽核名單或竄改權限。
+
+【強制技能與行為守則】：
+以下是你必須嚴格遵守的操作指南。請依照使用者當下的請求，對照下方的技能守則來調用工具：
+
+{skills_content}
 """
+
+# 在模組載入時，將讀取到的 skills.md 內容注入到 Prompt 中
+SYSTEM_PROMPT = BASE_PROMPT.format(skills_content=load_skills())
+
 
 def make_agent_app(mcp_tools: List, checkpointer=None):
     """
@@ -65,33 +86,27 @@ def make_agent_app(mcp_tools: List, checkpointer=None):
 
     # 🚦 【企業級動態路由】檢測 AI 的決策是否觸發安全邊界
     def route_tools(state: ITOpsAgentState):
-        """條件路由節點：解析 AI 工具呼叫的參數，動態決定是否放行"""
-        messages = state["messages"]
-        last_message = messages[-1]
+        """
+        動態路由節點：檢查即將呼叫的工具是否屬於高風險操作。
+        """
+        messages = state.get("messages", [])
+        if not messages:
+            return END
         
-        # 如果大腦沒有要呼叫工具，就結束對話
-        if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+        last_message = messages[-1]
+        if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
             return END
             
-        # 逐一檢查大腦準備呼叫的工具與其「參數」
         for tool_call in last_message.tool_calls:
-            name = tool_call["name"]
+            name = tool_call.get("name")
             args = tool_call.get("args", {})
             
-            # 絕對地雷 1：只要是呼叫遠端抹除，不管什麼理由，強制凍結審批
-            if name == "remote_wipe_device":
+            # 【Phase 2 優化】: update_ticket_status 不再視為需要凍結的敏感操作。
+            # 將工單送交給主管 (Pending_Approval) 屬於安全流程。
+            # 真正的敏感操作是 remote_wipe_device 等實體破壞性動作。
+            if name in ["remote_wipe_device"]:
                 print(f"⚠️ [HITL 觸發] 偵測到絕對高風險操作：{name}，強制凍結！")
                 return "sensitive_tools"
-                
-            # 絕對地雷 2 (AI 動態決策的體現)：
-            # AI 查閱 SOP 後，若「決定」將工單改為 'Pending_Approval'，系統才介入凍結。
-            # 若 AI 是將工單改為 'Resolved' 或 'Closed' 等安全狀態，則視為安全操作，直接放行。
-            if name == "update_ticket_status":
-                if args.get("status") == "Pending_Approval":
-                    print(f"⚠️ [HITL 觸發] AI 判斷該任務需主管簽核 (狀態: Pending_Approval)，啟動凍結機制！")
-                    return "sensitive_tools"
-                else:
-                    print(f"✅ [安全放行] 變更工單狀態為：{args.get('status')}，不需 HITL。")
                 
         # 通過所有檢查，走綠色通道放行
         return "safe_tools"
