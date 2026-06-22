@@ -101,7 +101,7 @@ class Incident(Base):
     # 優化：外鍵補上 index=True
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     
-    status = Column(String(50), nullable=False, default="Open")  # Open / Pending_Approval / Resolved / Closed
+    status = Column(String(50), nullable=False, default="Open")  # Open / Pending_Approval / Resolved / Closed / Cancelled / Reopened
     issue_description = Column(Text, nullable=False)
     resolution_notes = Column(Text, nullable=True)
     
@@ -166,6 +166,7 @@ class ChatThread(Base):
     
     title = Column(String(255), nullable=False, default="新對話")
     is_active = Column(Boolean, default=True)  # 若使用者刪除對話，則設為 False
+    is_pinned = Column(Boolean, default=False) # 支援釘選功能
     
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

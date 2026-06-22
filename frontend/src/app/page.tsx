@@ -2,7 +2,9 @@
 
 import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Send, Bot, User, AlertTriangle, CheckCircle, XCircle, RefreshCw, LogOut, MessageSquare, PlusCircle, Menu } from "lucide-react";
+import { Send, Bot, User, AlertTriangle, CheckCircle, 
+         XCircle, RefreshCw, LogOut, MessageSquare, PlusCircle, 
+         Menu, MoreVertical, Pin, PinOff, Pencil, Trash2, Check } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
 type Message = {
@@ -18,6 +20,7 @@ type Thread = {
   thread_id: string;
   title: string;
   updated_at: string;
+  is_pinned?: boolean;
 };
 
 export default function Home() {
@@ -35,6 +38,12 @@ export default function Home() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // 側邊欄進階 UI 狀態
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
 
   // 🛡️ 門禁系統與初始化
   useEffect(() => {
@@ -53,6 +62,13 @@ export default function Home() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // 點擊畫面任意處，自動關閉下拉選單
+  useEffect(() => {
+    const handleClickOutside = () => setMenuOpenId(null);
+    document.addEventListener("click", handleClickOutside);
+    return () => document.removeEventListener("click", handleClickOutside);
+  }, []);
 
   // 📥 載入歷史對話清單
   const loadThreads = async (email: string) => {
@@ -104,14 +120,32 @@ export default function Home() {
         // 成功撈取歷史訊息，直接覆蓋畫面
         setMessages(data.messages);
       } else {
-        // 該房間沒有歷史訊息（防呆）
-        setMessages([
-          {
-            id: Date.now().toString(),
-            role: "agent",
-            content: `歡迎回到對話空間：\`${selectedThreadId}\`\n\n請問有什麼我可以繼續幫忙的嗎？`,
-          }
-        ]);
+        // 🌟🌟🌟 企業級 UX：系統通知自動觸發邏輯 🌟🌟🌟
+        const match = selectedThreadId.match(/sys-notify-(INC-[A-Z0-9\-]+)/);
+        
+        if (match) {
+          // 如果是待簽核工單的通知房，且尚未有歷史對話
+          const ticketId = match[1];
+          setMessages([]); // 先清空畫面過場訊息
+          
+          // 延遲 100ms 自動幫主管發送隱藏指令給 AI，確保 React 狀態已準備好
+          setTimeout(() => {
+            sendMessage(
+              `【系統隱藏指令】我剛打開了工單 ${ticketId} 的審批通知。請幫我呼叫工具查詢這張工單的詳細內容、申請人是誰，以及完整的簽核關卡進度 (Approval Steps)。請整理成一份專業的「簽核摘要報告」呈現給我。`, 
+              "chat", 
+              selectedThreadId
+            );
+          }, 100);
+        } else {
+          // 正常的對話房沒紀錄時的預設防呆語
+          setMessages([
+            {
+              id: Date.now().toString(),
+              role: "agent",
+              content: `歡迎回到對話空間：\`${selectedThreadId}\`\n\n請問有什麼我可以繼續幫忙的嗎？`,
+            }
+          ]);
+        }
       }
     } catch (error) {
       setMessages([
@@ -132,7 +166,9 @@ export default function Home() {
   };
 
   // 🚀 傳送訊息 (包含完整 SSE 串流)
-  const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat") => {
+  const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat", targetThreadId?: string) => {
+    const currentThread = targetThreadId || threadId; // 確保使用正確的房間 ID
+
     if (!text.trim() && actionType === "chat") return;
 
     // 如果是點擊按鈕，立刻把畫面上所有舊按鈕消除，防止重複點擊
@@ -159,7 +195,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          thread_id: threadId,
+          thread_id: currentThread,
           message: text,
           email: currentUser?.email || "",
           action: actionType,
@@ -219,6 +255,49 @@ export default function Home() {
     }
   };
 
+// 📌 切換釘選狀態
+  const togglePin = async (threadId: string, currentPinStatus: boolean) => {
+    try {
+      await fetch(`http://127.0.0.1:8000/api/v1/threads/${threadId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_pinned: !currentPinStatus }),
+      });
+      if (currentUser) loadThreads(currentUser.email);
+    } catch (e) { console.error(e); }
+    setMenuOpenId(null);
+  };
+
+  // ✏️ 確認重新命名
+  const confirmRename = async (threadId: string) => {
+    if (!editTitle.trim()) return;
+    try {
+      await fetch(`http://127.0.0.1:8000/api/v1/threads/${threadId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: editTitle }),
+      });
+      if (currentUser) loadThreads(currentUser.email);
+    } catch (e) { console.error(e); }
+    setEditingThreadId(null);
+    setMenuOpenId(null);
+  };
+
+  // 🗑️ 刪除對話
+  const deleteThread = async (targetThreadId: string) => { 
+    const confirmDelete = window.confirm("確定要刪除這筆對話紀錄嗎？");
+    if (!confirmDelete) return;
+    try {
+      await fetch(`http://127.0.0.1:8000/api/v1/threads/${targetThreadId}`, { method: "DELETE" });
+      if (currentUser) loadThreads(currentUser.email);
+      
+      // 判斷「當前畫面所在的房間 (threadId)」是否等於「被刪除的房間 (targetThreadId)」
+      if (threadId === targetThreadId && currentUser) startNewChat(currentUser); 
+    } catch (e) { console.error(e); }
+    setMenuOpenId(null);
+  };
+
+
   if (!currentUser) return null;
 
   return (
@@ -237,27 +316,95 @@ export default function Home() {
             onClick={() => startNewChat(currentUser)}
             className="w-full flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors shadow-sm"
           >
-            <PlusCircle className="w-4 h-4" /> 建立新維運需求
+            <PlusCircle className="w-4 h-4" /> 建立新對話
           </button>
         </div>
 
         <div className="flex-1 overflow-y-auto px-3 py-2 space-y-1 custom-scrollbar">
           <div className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3 px-2 mt-2">近期對話紀錄</div>
+          
           {threads.map((thread) => (
-            <button 
-              key={thread.thread_id}
-              onClick={() => switchThread(thread.thread_id)}
-              className={`w-full flex flex-col text-left px-3 py-2.5 rounded-lg transition-colors group ${
-                threadId === thread.thread_id ? "bg-gray-800 border border-gray-700" : "hover:bg-gray-800 border border-transparent"
-              }`}
-            >
-              <div className="flex items-center gap-2 text-sm text-gray-200">
-                <MessageSquare className={`w-4 h-4 shrink-0 ${thread.title.includes("系統通知") ? "text-amber-400" : "text-gray-400"}`} />
-                <span className="truncate font-medium">{thread.title}</span>
-              </div>
-              <span className="text-[11px] text-gray-500 pl-6 mt-1">{thread.updated_at}</span>
-            </button>
+            <div key={thread.thread_id} className="relative group">
+              {editingThreadId === thread.thread_id ? (
+                // ✏️ 編輯模式 UI
+                <div className="w-full flex items-center bg-gray-800 px-2 py-2 rounded-lg border border-blue-500">
+                  <input
+                    type="text"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && confirmRename(thread.thread_id)}
+                    className="flex-1 bg-transparent text-sm text-white outline-none"
+                    autoFocus
+                  />
+                  <button onClick={() => confirmRename(thread.thread_id)} className="p-1 text-green-400 hover:text-green-300">
+                    <Check className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => setEditingThreadId(null)} className="p-1 text-gray-400 hover:text-gray-300">
+                    <XCircle className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                // 🟢 正常顯示模式 UI
+                <button 
+                  onClick={() => switchThread(thread.thread_id)}
+                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg transition-colors ${
+                    threadId === thread.thread_id ? "bg-gray-800 border border-gray-700" : "hover:bg-gray-800 border border-transparent"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 text-sm text-gray-200 overflow-hidden">
+                    {thread.is_pinned ? (
+                      <Pin className="w-4 h-4 shrink-0 text-blue-400" />
+                    ) : (
+                      <MessageSquare className={`w-4 h-4 shrink-0 ${thread.title.includes("系統通知") ? "text-amber-400" : "text-gray-400"}`} />
+                    )}
+                    <span className="truncate font-medium text-left">{thread.title}</span>
+                  </div>
+                  
+                  {/* Hover 時才出現的「⋯」按鈕 */}
+                  <div 
+                    className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-gray-700 rounded-md shrink-0"
+                    onClick={(e) => {
+                      e.stopPropagation(); // 阻止事件冒泡觸發 switchThread
+                      setMenuOpenId(menuOpenId === thread.thread_id ? null : thread.thread_id);
+                    }}
+                  >
+                    <MoreVertical className="w-4 h-4 text-gray-400" />
+                  </div>
+                </button>
+              )}
+
+              {/* 🎯 展開的下拉選單 (Dropdown Menu) */}
+              {menuOpenId === thread.thread_id && (
+                <div className="absolute right-2 top-10 w-36 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 overflow-hidden py-1">
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); togglePin(thread.thread_id, !!thread.is_pinned); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 transition-colors"
+                  >
+                    {thread.is_pinned ? <PinOff className="w-4 h-4" /> : <Pin className="w-4 h-4" />}
+                    {thread.is_pinned ? "取消釘選" : "釘選"}
+                  </button>
+                  <button 
+                    onClick={(e) => { 
+                      e.stopPropagation(); 
+                      setEditTitle(thread.title); 
+                      setEditingThreadId(thread.thread_id); 
+                      setMenuOpenId(null); 
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-gray-200 hover:bg-gray-700 transition-colors"
+                  >
+                    <Pencil className="w-4 h-4" /> 重新命名
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); deleteThread(thread.thread_id); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-400 hover:bg-gray-700 transition-colors"
+                  >
+                    <Trash2 className="w-4 h-4" /> 刪除
+                  </button>
+                </div>
+              )}
+            </div>
           ))}
+          
           {threads.length === 0 && (
             <div className="text-sm text-gray-500 text-center mt-6">尚無對話紀錄</div>
           )}
@@ -288,7 +435,7 @@ export default function Home() {
             <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-1.5 text-gray-500 hover:text-gray-800 bg-gray-100 rounded-md transition-colors">
               <Menu className="w-5 h-5" />
             </button>
-            <h1 className="text-lg font-bold text-gray-800 tracking-tight">維運對話空間</h1>
+            <h1 className="text-lg font-bold text-gray-800 tracking-tight">ITOps 智能助手</h1>
           </div>
           <div className="text-xs font-mono bg-blue-50 text-blue-600 px-3 py-1 rounded-full border border-blue-100">
             Thread ID: {threadId.substring(0, 15)}...
@@ -334,25 +481,71 @@ export default function Home() {
               </div>
             ))}
             <div ref={messagesEndRef} />
+            {/* 🌟 專屬 BPM 簽核的 Quick Actions 快捷鍵 🌟 */}
+            {threadId.startsWith("sys-notify-") && messages.length > 0 && !isLoading && (
+              <div className="flex flex-wrap gap-3 mt-6 pt-4 border-t border-gray-200 animate-in fade-in duration-300">
+                <span className="text-sm font-semibold text-gray-500 w-full mb-1">主管快捷簽核：</span>
+                <button 
+                  onClick={() => sendMessage("✅ 我同意核准此工單 (Approve)。請幫我執行。")} 
+                  className="flex items-center gap-1.5 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm"
+                >
+                   <CheckCircle className="w-4 h-4" /> 核准放行
+                </button>
+                <button 
+                  onClick={() => sendMessage("🔄 請將此工單退回給前一關的主管重新評估 (Reject Previous)。")} 
+                  className="flex items-center gap-1.5 bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm"
+                >
+                   <RefreshCw className="w-4 h-4" /> 退回前一關
+                </button>
+                <button 
+                  onClick={() => sendMessage("❌ 我拒絕此申請，請直接退回給原申請人 (Reject Applicant)。")} 
+                  className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm"
+                >
+                   <XCircle className="w-4 h-4" /> 退回申請人
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
         {/* 底部輸入區 */}
         <footer className="absolute bottom-0 w-full bg-gradient-to-t from-gray-50 via-gray-50 to-transparent p-4 pt-10 z-10">
           <div className="max-w-3xl mx-auto relative bg-white rounded-xl shadow-sm border border-gray-200">
-            <input
-              type="text"
+            <textarea
+              ref={textareaRef} // 綁定 ref 到 textarea 標籤上
               value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && sendMessage(input)}
-              placeholder="請輸入您的維運需求... (按 Enter 發送)"
+              onChange={(e) => {
+                setInput(e.target.value);
+                // 簡易的 Auto-resize 邏輯：讓輸入框隨文字長高，最高不超過 160px
+                e.target.style.height = 'auto';
+                e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
+              }}
+              onKeyDown={(e) => {
+                // 攔截 Enter 鍵：如果是 Enter 且沒按 Shift，就送出訊息
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault(); // 阻止預設的換行行為
+                  if (!isLoading && input.trim()) {
+                    sendMessage(input);
+                    // 改用 textareaRef 來縮回高度
+                    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+                  }
+                }
+              }}
+              rows={1}
+              placeholder="請輸入您的維運需求... (Shift + Enter 換行，Enter 發送)"
               disabled={isLoading}
-              className="w-full pl-5 pr-14 py-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-800 bg-transparent disabled:opacity-50"
+              className="w-full pl-5 pr-14 py-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-800 bg-transparent disabled:opacity-50 resize-none overflow-y-auto leading-relaxed"
+              style={{ minHeight: '56px' }}
             />
             <button 
-              onClick={() => sendMessage(input)}
+              onClick={() => {
+                sendMessage(input);
+                // 點擊發送按鈕時，也把輸入框高度縮回原狀
+                if (textareaRef.current) textareaRef.current.style.height = 'auto';
+              }}
               disabled={isLoading || !input.trim()}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-2.5 text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors shadow-sm disabled:opacity-40"
+              // 注意：這裡把 top-1/2 改成了 bottom-2，確保輸入框長高時，按鈕依然貼齊右下角
+              className="absolute right-2 bottom-2 p-2.5 text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors shadow-sm disabled:opacity-40"
             >
               <Send className="w-4 h-4" />
             </button>

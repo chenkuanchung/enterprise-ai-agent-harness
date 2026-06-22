@@ -159,6 +159,34 @@ async def chat_endpoint(request: ChatRequest):
     global agent_app
     if agent_app is None:
         raise HTTPException(status_code=503, detail="Agent 服務尚未初始化完成，請稍後再試。")
+    
+    # 檢查並自動建立側邊欄 ChatThread 紀錄
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. 檢查這個 thread_id 是否已經在側邊欄資料庫裡
+            thread_res = await session.execute(select(ChatThread).filter_by(thread_id=request.thread_id))
+            existing_thread = thread_res.scalars().first()
+
+            # 2. 如果是全新的對話，自動幫使用者建檔
+            if not existing_thread:
+                user_res = await session.execute(select(User).filter_by(email=request.email))
+                user_obj = user_res.scalars().first()
+
+                if user_obj:
+                    # 擷取使用者第一句話的前 20 個字當作側邊欄標題
+                    first_msg = request.message if request.action == "chat" else "未命名對話"
+                    short_title = first_msg[:20] + ("..." if len(first_msg) > 20 else "")
+                    
+                    new_thread = ChatThread(
+                        thread_id=request.thread_id,
+                        tenant_id=user_obj.tenant_id,
+                        user_id=user_obj.id,
+                        title=short_title
+                    )
+                    session.add(new_thread)
+                    await session.commit()
+        except Exception as e:
+            print(f"❌ 無法寫入 ChatThread 紀錄: {e}")
         
     async def event_generator():
         try:
@@ -174,7 +202,11 @@ async def chat_endpoint(request: ChatRequest):
                     # 🛡️ 企業級 ABAC 防線：不看 Role，看「動態資源權限」
                     
                     # 1. 取出 AI 當下被凍結的「危險工具呼叫」
-                    last_msg = current_state.values.get("messages", [])[-1]
+                    messages = current_state.values.get("messages", [])
+                    if not messages:
+                        yield f"data: {json.dumps({'type': 'error', 'content': '無法取得歷史訊息以驗證操作。'})}\n\n"
+                        return
+                    last_msg = messages[-1]
                     tool_calls = getattr(last_msg, "tool_calls", [])
                     
                     if not tool_calls:
@@ -295,7 +327,53 @@ async def chat_endpoint(request: ChatRequest):
 
     # 使用 FastAPI 的 StreamingResponse 回傳 SSE 格式
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-    
+
+# ----------------------------------------------------
+# 對話管理 API (重新命名、釘選、軟刪除)
+# ----------------------------------------------------
+class ThreadUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    is_pinned: Optional[bool] = None
+
+@app.patch("/api/v1/threads/{thread_id}")
+async def update_thread(thread_id: str, request: ThreadUpdateRequest):
+    """[企業級功能] 重新命名或切換釘選狀態"""
+    async with AsyncSessionLocal() as session:
+        try:
+            res = await session.execute(select(ChatThread).filter_by(thread_id=thread_id, is_active=True))
+            thread = res.scalars().first()
+            if not thread:
+                raise HTTPException(status_code=404, detail="找不到此對話")
+            
+            if request.title is not None:
+                thread.title = request.title
+            if request.is_pinned is not None:
+                thread.is_pinned = request.is_pinned
+                
+            await session.commit()
+            return {"status": "success", "message": "更新成功"}
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/threads/{thread_id}")
+async def delete_thread(thread_id: str):
+    """[企業級功能] 軟刪除對話紀錄"""
+    async with AsyncSessionLocal() as session:
+        try:
+            res = await session.execute(select(ChatThread).filter_by(thread_id=thread_id))
+            thread = res.scalars().first()
+            if not thread:
+                raise HTTPException(status_code=404, detail="找不到此對話")
+            
+            # 企業級做法：軟刪除 (Soft Delete)，保留供資安稽核
+            thread.is_active = False 
+            await session.commit()
+            return {"status": "success", "message": "已刪除對話"}
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/threads")
 async def get_user_threads(email: str):
     """
@@ -309,11 +387,11 @@ async def get_user_threads(email: str):
             if not user_obj:
                 raise HTTPException(status_code=404, detail="找不到該使用者")
 
-            # 2. 撈取對話紀錄並依更新時間排序
+            # 2. 撈取對話紀錄：優先顯示釘選，再依更新時間排序
             threads_res = await session.execute(
                 select(ChatThread)
                 .filter_by(user_id=user_obj.id, is_active=True)
-                .order_by(ChatThread.updated_at.desc())
+                .order_by(ChatThread.is_pinned.desc(), ChatThread.updated_at.desc()) # 👈 排序邏輯升級
             )
             threads = threads_res.scalars().all()
 
@@ -321,6 +399,7 @@ async def get_user_threads(email: str):
                 {
                     "thread_id": t.thread_id,
                     "title": t.title,
+                    "is_pinned": t.is_pinned,  # 👈 新增回傳
                     "updated_at": t.updated_at.strftime("%Y-%m-%d %H:%M")
                 }
                 for t in threads

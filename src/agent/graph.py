@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from src.rag.knowledge_base import search_it_sop
 from src.agent.state import ITOpsAgentState
+from pathlib import Path
 
 # ==========================================
 # 動態載入技能檔 (Skills Injection)
@@ -16,9 +17,9 @@ def load_skills() -> str:
     在系統啟動時，動態讀取 skills.md 作為大腦的絕對行為守則。
     這樣未來修改流程，只需改 Markdown，不用動 Python 程式碼。
     """
-    # 取得專案根目錄下的 docs/skills.md 路徑 (假設 graph.py 在 src/agent/ 下)
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    skills_path = os.path.join(base_dir, "docs", "skills.md")
+    # 取得專案根目錄下的 docs/skills.md 路徑
+    base_dir = Path(__file__).resolve().parent.parent.parent
+    skills_path = base_dir / "docs" / "skills.md"
     
     try:
         with open(skills_path, "r", encoding="utf-8") as f:

@@ -64,6 +64,33 @@ async def unlock_account(email: str) -> str:
 # 透過 MCP 協定暴露的 MDM & CMDB 工具
 # ==========================================
 @mcp.tool()
+async def get_my_devices(email: str) -> str:
+    """查詢該員工名下擁有哪些 IT 設備與編號。當使用者沒有提供設備編號時，優先呼叫此工具查詢。"""
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. 先找出這位使用者的 ID
+            user_res = await session.execute(select(User).filter_by(email=email))
+            user = user_res.scalars().first()
+            if not user:
+                return format_error(f"找不到信箱為 '{email}' 的員工紀錄。")
+            
+            # 2. 找出他名下的所有設備
+            devices_res = await session.execute(select(Device).filter_by(owner_id=user.id))
+            devices = devices_res.scalars().all()
+            
+            if not devices:
+                return format_success({"message": "您名下目前沒有登記任何 IT 設備。"})
+                
+            # 3. 整理設備清單回傳給 AI
+            dev_list = [
+                {"device_id": d.device_id, "os_version": d.os_version} 
+                for d in devices
+            ]
+            return format_success({"devices": dev_list})
+        except Exception as e:
+            return format_error(f"查詢設備失敗: {str(e)}")
+
+@mcp.tool()
 async def get_device_health(device_id: str) -> str:
     """查詢特定設備的健康狀態 (作業系統、合規狀態與剩餘硬碟空間)。"""
     async with AsyncSessionLocal() as session:
@@ -168,9 +195,15 @@ async def update_ticket_status(ticket_id: str, status: str, resolution_notes: st
     """
     [通用工具] 更新工單狀態與備註。
     參數說明：
-    - status: 支援 'Pending_Approval' (等待主管簽核), 'Resolved' (已解決), 'Closed' 等狀態。
+    - status: 必須是以下六種狀態之一：
+        1. 'Open' (新開單 / 處理中)
+        2. 'Pending_Approval' (等待主管與 IT 簽核)
+        3. 'Resolved' (技術問題已解決，等待使用者確認)
+        4. 'Closed' (完全結案)
+        5. 'Cancelled' (需求取消或作廢)
+        6. 'Reopened' (使用者反應問題未解決，退回重新處理)
     - resolution_notes: 處理紀錄或備註。
-    注意：若涉及高風險軟體(Tier 4)或設備抹除，必須先將狀態改為 'Pending_Approval'。
+    注意：若涉及需授權之高風險操作或設備抹除，必須先將狀態改為 'Pending_Approval' 以觸發 BPM 流程。
     """
     async with AsyncSessionLocal() as session:
         try:
@@ -423,6 +456,58 @@ async def submit_for_approval(ticket_id: str, email: str, tier: int) -> str:
             return format_error(f"送簽失敗: {str(e)}")
 
 @mcp.tool()
+async def get_approval_status(ticket_id: str) -> str:
+    """[審批輔助工具] 查詢特定工單目前的詳細內容與「完整簽核進度與名單 (Approval Steps)」。用於主管審批前調閱上下文。"""
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. 取得工單與申請人
+            inc_res = await session.execute(select(Incident).filter_by(ticket_id=ticket_id))
+            incident = inc_res.scalars().first()
+            if not incident:
+                return format_error("查無此工單。")
+
+            user_res = await session.execute(select(User).filter_by(id=incident.user_id))
+            applicant = user_res.scalars().first()
+            applicant_name = applicant.full_name if applicant else "未知申請人"
+
+            # 2. 取得簽核關卡
+            steps_res = await session.execute(
+                select(ApprovalStep)
+                .filter_by(incident_id=incident.id)
+                .order_by(asc(ApprovalStep.step_order))
+            )
+            steps = steps_res.scalars().all()
+
+            if not steps:
+                return format_success({
+                    "ticket_id": ticket_id, "applicant": applicant_name, 
+                    "description": incident.issue_description, "message": "此工單無簽核關卡設定。"
+                })
+
+            # 3. 整理簽核鏈
+            chain = []
+            for s in steps:
+                approver_res = await session.execute(select(User).filter_by(id=s.approver_id))
+                approver = approver_res.scalars().first()
+                chain.append({
+                    "step": s.step_order,
+                    "role": s.role_type,
+                    "approver": approver.full_name if approver else "未知",
+                    "status": s.status,
+                    "comments": s.comments or ""
+                })
+
+            return format_success({
+                "ticket_id": ticket_id,
+                "applicant": applicant_name,
+                "description": incident.issue_description,
+                "current_status": incident.status,
+                "approval_chain": chain
+            })
+        except Exception as e:
+            return format_error(f"查詢簽核狀態失敗: {str(e)}")
+
+@mcp.tool()
 async def process_approval(ticket_id: str, action: str, comments: str = "") -> str:
     """
     [審批工具] 處理簽核動作。
@@ -440,6 +525,7 @@ async def process_approval(ticket_id: str, action: str, comments: str = "") -> s
                 select(ApprovalStep)
                 .filter_by(incident_id=incident.id, status="Pending")
                 .order_by(asc(ApprovalStep.step_order))
+                .with_for_update()
             )
             current_step = step_res.scalars().first()
             
@@ -506,6 +592,8 @@ class TicketStatus(str, Enum):
     PENDING_APPROVAL = "Pending_Approval"
     RESOLVED = "Resolved"
     CLOSED = "Closed"
+    CANCELLED = "Cancelled"
+    REOPENED = "Reopened"
 
 # ==========================================
 # 透過 MCP 協定暴露的通用查詢工具
