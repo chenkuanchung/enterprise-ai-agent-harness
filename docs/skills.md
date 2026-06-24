@@ -8,13 +8,14 @@
 **觸發時機：** 當使用者提出軟體安裝、權限申請、架構變更等實質維運需求時。
 
 **嚴格執行步驟：**
-1. **確認需求與 Tier 等級：** 先透過檢索文件判斷該需求的風險等級 (Tier 1~4)。若資訊不足，主動向使用者釐清。
+1. **確認需求與 Tier 等級：** 必須檢索 `it_sop.md` 來判斷該需求的風險等級 (Tier 1~4)。
+   * **🚨 預算反問機制：** 若使用者的需求屬於「設備採購、機房建置、系統擴充」等實體專案，且對話中未提供具體金額，Agent **絕對不可自行瞎猜 Tier 等級**，必須主動向使用者提問：「請問此專案的大致預算範圍是多少？」以利精準分級。
 2. **開立草稿工單：** 呼叫 `create_ticket` 工具，建立一張狀態為 `Open` 的工單。
 3. **🚨 強制依賴底層路由：** 呼叫 `evaluate_approval_chain(email, tier)` 工具。
    * *絕對禁止：* Agent 嚴禁自行猜測、編造或依賴過去對話紀錄來決定簽核主管名單。一切以工具回傳的陣列為準。
 4. **使用者最終確認：** 將工具回傳的「簽核關卡與主管名單」完整呈現給使用者，並詢問：「請問是否確認送出簽核？」
-5. **觸發流程 (BPM)：** * 若使用者回覆「確認」：呼叫 `update_ticket_status(status="Pending_Approval")` 將工單送交審批，系統將自動通知第一關主管。
-   * 若使用者回覆「取消」：呼叫 `update_ticket_status(status="Cancelled", resolution_notes="使用者自行取消申請")`。
+5. **觸發流程 (BPM)：** * 若使用者回覆「確認」：**絕對不可只呼叫 update_ticket_status**，必須呼叫 `submit_for_approval(ticket_id, email, tier)` 將工單正式送入 BPM 系統，系統底層會自動計算簽核鏈並通知第一關主管。
+   * 若使用者回覆「取消」：呼叫 `update_ticket_status(ticket_id, status="Cancelled", resolution_notes="使用者自行取消申請")`。
 
 ---
 

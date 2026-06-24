@@ -286,33 +286,20 @@ async def remote_wipe_device(device_id: str) -> str:
 # ==========================================
 
 async def _calculate_chain(session, user: User, tier: int) -> list:
-    """[企業實務版] 支援「越級簽核 / 彈性遞補」的雙軌簽核名單 (包含 Tier 4 最高層級)"""
+    """[企業實務版] 支援「越級簽核 / 彈性遞補」與「全域去重」的雙軌簽核名單"""
     chain = []
     step = 1
+    seen_approver_ids = set() # 全域去重池
 
-    # ==========================================
-    # 軌道一：User 端 (業務需求核准)
-    # 邏輯：順著 manager_id 往上爬
-    # ==========================================
-    if tier >= 2:
-        if user.manager_id:
-            user_mgr = await session.execute(select(User).filter_by(id=user.manager_id))
-            mgr = user_mgr.scalars().first()
-            if mgr:
-                chain.append({"step": step, "role_type": "User 端直屬/最高主管", "approver": mgr})
-                step += 1
-            else:
-                raise Exception("無法生成簽核鏈：資料庫遺失您的主管資料。")
-        else:
-            # 申請人無主管 (本身已是最高層)
-            chain.append({"step": step, "role_type": "User 端 (系統判定免簽/最高層)", "approver": user})
+    # 內部輔助函式：負責加入簽核節點並自動去重
+    def add_step(role_type: str, approver: User):
+        nonlocal step
+        # 只有當這個人「從未出現在前面的簽核鏈」且「不是申請人本人」時才加入
+        if approver.id not in seen_approver_ids and approver.id != user.id:
+            chain.append({"step": step, "role_type": role_type, "approver": approver})
+            seen_approver_ids.add(approver.id)
             step += 1
 
-    # ==========================================
-    # 軌道二：IT 端 (技術、資安與高階決行)
-    # 邏輯：使用業務頭銜，支援找不到人時往上找，並嚴格去重
-    # ==========================================
-    
     # 定義職級尋找順序 (權限由小到大)
     async def find_it_approver(preferred_roles: list) -> User:
         for role in preferred_roles:
@@ -322,22 +309,44 @@ async def _calculate_chain(session, user: User, tier: int) -> list:
                 return approver
         return None
 
+    # ==========================================
+    # 軌道一：User 端 (業務需求核准)
+    # ==========================================
+    if tier >= 2:
+        if user.manager_id:
+            user_mgr = await session.execute(select(User).filter_by(id=user.manager_id))
+            mgr = user_mgr.scalars().first()
+            if mgr:
+                add_step("User 端直屬主管", mgr)
+                
+                # Tier 3 以上必須抓出 User 處長 (主管的主管)
+                if tier >= 3 and mgr.manager_id:
+                    user_director_res = await session.execute(select(User).filter_by(id=mgr.manager_id))
+                    user_director = user_director_res.scalars().first()
+                    if user_director:
+                        add_step("User 端處長", user_director)
+            else:
+                raise Exception("無法生成簽核鏈：資料庫遺失您的主管資料。")
+        else:
+            # 申請人無主管 (本身已是最高層)
+            # 注意：這裡不呼叫 add_step，因為申請人不用自己簽核自己，直接略過或記錄為免簽
+            chain.append({"step": step, "role_type": "User 端 (系統判定免簽/最高層)", "approver": user})
+            step += 1
+
+    # ==========================================
+    # 軌道二：IT 端 (技術、資安與高階決行)
+    # ==========================================
     if tier >= 2:
         it_mgr = await find_it_approver(["it_manager", "it_director"])
         if it_mgr:
-            chain.append({"step": step, "role_type": "IT 維運審查", "approver": it_mgr})
-            step += 1
+            add_step("IT 維運審查", it_mgr)
         else:
             raise Exception("系統異常：找不到任何 IT 經理或處長來執行 Tier 2 簽核。")
 
     if tier >= 3:
         it_director = await find_it_approver(["it_director", "vp_it", "cio"])
         if it_director:
-            # 【去重邏輯】如果上一關代簽的主管與此關相同，免重複簽核
-            last_approver = chain[-1]["approver"]
-            if last_approver.id != it_director.id:
-                chain.append({"step": step, "role_type": "IT 處長/高階資安審查", "approver": it_director})
-                step += 1
+            add_step("IT 處長/高階資安審查", it_director)
         else:
             raise Exception("系統異常：找不到具備 IT 處長 (it_director) 級別以上之主管來執行 Tier 3 簽核。")
 
@@ -345,37 +354,26 @@ async def _calculate_chain(session, user: User, tier: int) -> list:
     # 軌道三：C-Level 企業高階決行 (Tier 4 專屬)
     # ==========================================
     if tier >= 4:
-        # 1. 副總裁 (VP) 會簽
         vp = await find_it_approver(["vp", "vp_it", "cio"])
         if vp:
-            last_approver = chain[-1]["approver"]
-            if last_approver.id != vp.id:
-                chain.append({"step": step, "role_type": "副總 (VP) 決策審查", "approver": vp})
-                step += 1
+            add_step("副總 (VP) 決策審查", vp)
         else:
-            raise Exception("系統異常：Tier 4 極高風險專案必須由 副總(VP) 級別以上主管簽核，但系統查無此角色。")
+            raise Exception("系統異常：Tier 4 必須由 副總(VP) 級別以上主管簽核，但系統查無此角色。")
 
-        # 2. 總經理 (GM) 會簽
         gm = await find_it_approver(["gm", "ceo"])
         if gm:
-            last_approver = chain[-1]["approver"]
-            if last_approver.id != gm.id:
-                chain.append({"step": step, "role_type": "總經理 (GM) 決策審查", "approver": gm})
-                step += 1
+            add_step("總經理 (GM) 決策審查", gm)
         else:
-            raise Exception("系統異常：Tier 4 極高風險專案必須由 總經理(GM) 簽核，但系統查無此角色。")
+            raise Exception("系統異常：Tier 4 必須由 總經理(GM) 簽核，但系統查無此角色。")
 
-        # 3. 董事長 (Chairman) 最終決行
         chairman = await find_it_approver(["chairman"])
         if chairman:
-            last_approver = chain[-1]["approver"]
-            if last_approver.id != chairman.id:
-                chain.append({"step": step, "role_type": "董事長 (Chairman) 最終決行", "approver": chairman})
-                step += 1
+            add_step("董事長 (Chairman) 最終決行", chairman)
         else:
-            raise Exception("系統異常：Tier 4 極高風險專案必須由 董事長(Chairman) 最終決行，但系統查無此角色。")
+            raise Exception("系統異常：Tier 4 必須由 董事長(Chairman) 最終決行，但系統查無此角色。")
 
     return chain
+
 
 @mcp.tool()
 async def evaluate_approval_chain(email: str, tier: int) -> str:
@@ -441,7 +439,7 @@ async def submit_for_approval(ticket_id: str, email: str, tier: int) -> str:
             first_approver = chain[0]["approver"]
             thread_title = f"[系統通知] 待簽核工單 {ticket_id}"
             new_thread = ChatThread(
-                thread_id=f"sys-notify-{ticket_id}-{uuid.uuid4().hex[:6]}",
+                thread_id=f"sys-notify-{ticket_id}", 
                 tenant_id=incident.tenant_id,
                 user_id=first_approver.id,
                 title=thread_title
@@ -468,7 +466,8 @@ async def get_approval_status(ticket_id: str) -> str:
 
             user_res = await session.execute(select(User).filter_by(id=incident.user_id))
             applicant = user_res.scalars().first()
-            applicant_name = applicant.full_name if applicant else "未知申請人"
+            # 🌟 優化：將申請人資訊寫得更明確，防範 AI 幻覺
+            applicant_info = f"{applicant.department} - {applicant.full_name} ({applicant.email})" if applicant else "未知申請人"
 
             # 2. 取得簽核關卡
             steps_res = await session.execute(
@@ -480,8 +479,10 @@ async def get_approval_status(ticket_id: str) -> str:
 
             if not steps:
                 return format_success({
-                    "ticket_id": ticket_id, "applicant": applicant_name, 
-                    "description": incident.issue_description, "message": "此工單無簽核關卡設定。"
+                    "ticket_id": ticket_id, 
+                    "applicant_info": applicant_info,
+                    "description": incident.issue_description, 
+                    "message": "此工單無簽核關卡設定。"
                 })
 
             # 3. 整理簽核鏈
@@ -499,7 +500,7 @@ async def get_approval_status(ticket_id: str) -> str:
 
             return format_success({
                 "ticket_id": ticket_id,
-                "applicant": applicant_name,
+                "applicant_info": applicant_info,
                 "description": incident.issue_description,
                 "current_status": incident.status,
                 "approval_chain": chain
@@ -546,6 +547,20 @@ async def process_approval(ticket_id: str, action: str, comments: str = "") -> s
                 if next_step:
                     next_step.status = "Pending"
                     msg = "已核准。流程將進入下一關。"
+                    
+                    # 🌟🌟🌟 核心修復：幫下一關主管建立系統通知房間 🌟🌟🌟
+                    next_approver_res = await session.execute(select(User).filter_by(id=next_step.approver_id))
+                    next_approver = next_approver_res.scalars().first()
+                    if next_approver:
+                        thread_title = f"[系統通知] 待簽核工單 {ticket_id}"
+                        # 為避免重複，房間 ID 加上關卡數字後綴 (前端 Regex 剛剛已防呆)
+                        new_thread = ChatThread(
+                            thread_id=f"sys-notify-{ticket_id}-{current_step.step_order + 1}",
+                            tenant_id=incident.tenant_id,
+                            user_id=next_approver.id,
+                            title=thread_title
+                        )
+                        session.add(new_thread)
                 else:
                     incident.status = "Approved" # 全部簽完
                     msg = "已核准。此工單的所有簽核皆已完成，可開始執行維運操作。"

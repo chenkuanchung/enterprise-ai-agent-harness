@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Send, Bot, User, AlertTriangle, CheckCircle, 
          XCircle, RefreshCw, LogOut, MessageSquare, PlusCircle, 
-         Menu, MoreVertical, Pin, PinOff, Pencil, Trash2, Check } from "lucide-react";
+         Menu, MoreVertical, Pin, PinOff, Pencil, Trash2, Check, UserPlus} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
 type Message = {
@@ -120,8 +120,9 @@ export default function Home() {
         // 成功撈取歷史訊息，直接覆蓋畫面
         setMessages(data.messages);
       } else {
-        // 🌟🌟🌟 企業級 UX：系統通知自動觸發邏輯 🌟🌟🌟
-        const match = selectedThreadId.match(/sys-notify-(INC-[A-Z0-9\-]+)/);
+        // 企業級 UX：系統通知自動觸發邏輯
+        // 改為純大寫與數字，確保不會抓到後面的後綴
+        const match = selectedThreadId.match(/sys-notify-(INC-[A-Z0-9]+)/);
         
         if (match) {
           // 如果是待簽核工單的通知房，且尚未有歷史對話
@@ -130,11 +131,16 @@ export default function Home() {
           
           // 延遲 100ms 自動幫主管發送隱藏指令給 AI，確保 React 狀態已準備好
           setTimeout(() => {
-            sendMessage(
-              `【系統隱藏指令】我剛打開了工單 ${ticketId} 的審批通知。請幫我呼叫工具查詢這張工單的詳細內容、申請人是誰，以及完整的簽核關卡進度 (Approval Steps)。請整理成一份專業的「簽核摘要報告」呈現給我。`, 
-              "chat", 
-              selectedThreadId
-            );
+            const hiddenPrompt = `【系統自動排程】我(主管)剛打開了工單 ${ticketId} 的審批通知。
+請呼叫 get_approval_status 工具查詢此工單。
+
+🚨 回覆嚴格要求：
+1. 語氣必須是「主動通知的主管秘書」，例如：「您好，這裡有一張工單正等待您的簽核...」
+2. 根據工具回傳的資料，明確指出「申請人」是誰（絕對不要跟當前對話的主管搞混）。
+3. 條列式呈現：申請人、工單內容、完整的簽核進度與狀態。
+4. 直接輸出摘要結果，絕不要在回覆中提到這是一條隱藏指令。`;
+
+            sendMessage(hiddenPrompt, "chat", selectedThreadId, true); // 👈 加上 true 啟動隱藏模式
           }, 100);
         } else {
           // 正常的對話房沒紀錄時的預設防呆語
@@ -166,7 +172,7 @@ export default function Home() {
   };
 
   // 🚀 傳送訊息 (包含完整 SSE 串流)
-  const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat", targetThreadId?: string) => {
+  const sendMessage = async (text: string, actionType: "chat" | "approve" | "reject" = "chat", targetThreadId?: string, isHidden: boolean = false) => {
     const currentThread = targetThreadId || threadId; // 確保使用正確的房間 ID
 
     if (!text.trim() && actionType === "chat") return;
@@ -186,7 +192,13 @@ export default function Home() {
       id: agentMessageId, role: "agent", content: "", statusText: "🧠 大腦正在接收請求...", isStreaming: true,
     };
 
-    setMessages((prev) => [...prev, userMessage, initialAgentMessage]);
+    // 如果是隱藏指令，就不要把 userMessage 放進畫面裡
+    if (isHidden) {
+      setMessages((prev) => [...prev, initialAgentMessage]);
+    } else {
+      setMessages((prev) => [...prev, userMessage, initialAgentMessage]);
+    }
+
     setInput("");
     setIsLoading(true);
 
@@ -364,7 +376,9 @@ export default function Home() {
                   <div 
                     className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-gray-700 rounded-md shrink-0"
                     onClick={(e) => {
-                      e.stopPropagation(); // 阻止事件冒泡觸發 switchThread
+                      e.preventDefault();
+                      e.stopPropagation(); 
+                      e.nativeEvent.stopImmediatePropagation();
                       setMenuOpenId(menuOpenId === thread.thread_id ? null : thread.thread_id);
                     }}
                   >
@@ -502,6 +516,12 @@ export default function Home() {
                   className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm"
                 >
                    <XCircle className="w-4 h-4" /> 退回申請人
+                </button>
+                <button 
+                  onClick={() => sendMessage("👥 針對此單，我需要邀請其他專家評估。請幫我啟動加簽流程 (Add Co-signer)。")} 
+                  className="flex items-center gap-1.5 bg-indigo-500 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm transition-colors shadow-sm"
+                >
+                   <UserPlus className="w-4 h-4" /> 邀請加簽
                 </button>
               </div>
             )}
